@@ -1,1 +1,0 @@
-Take the Reddit post link from input.txt, gather all the comments from that post, and save them in output.txt.
