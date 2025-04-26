@@ -1,6 +1,7 @@
-src/reddit.py
-src/data/output.txt
-src/deploy/model.pth
+#Binary files
+src/checkpoints/
+src/train.bin
+src/test.bin
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
