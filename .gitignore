@@ -1,4 +1,5 @@
 #Binary files
+src/sample-10BT_cl100k_base/
 src/checkpoints/
 src/train.bin
 src/test.bin

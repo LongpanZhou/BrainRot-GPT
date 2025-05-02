@@ -27,7 +27,7 @@ class CasualSelfAttention(nn.Module):
 
         # Linear Projections
         self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=self.bias)
-        self.c_proj = nn.Linear(self.n_embd, self.n_embd)
+        self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
 
         # Regularization
         self.attn_dropout = nn.Dropout(self.dropout)
@@ -65,11 +65,12 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gelu = nn.GELU(approximate='tanh')
         self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
-        return self.dropout(self.c_proj(F.gelu(self.c_fc(x), approximate='tanh')))
+        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -88,6 +89,7 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+
         print("Creating Model...")
         self.transformer = nn.ModuleDict(
             dict(
@@ -100,9 +102,15 @@ class GPT(nn.Module):
         )
 
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.lm_head.weight = self.transformer.wte.weight
+        self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
+
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layers))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
@@ -128,27 +136,28 @@ class GPT(nn.Module):
 
         x = self.transformer.ln_f(x)
 
-        logits = self.lm_head(x) # (B, T, vocab_size)
-        loss = None
-
         if targets is not None:
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))
+            # Training mode
+            logits = self.lm_head(x)
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        else:
+            # Inference mode (e.g., during autoregressive generation)
+            logits = self.lm_head(x[:, [-1], :])  # Only compute logits for last token
+            loss = None
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=0):
+    def generate(self, idx, max_new_tokens, temperature=1.0, end_token=None):
         for _ in range(max_new_tokens):
             idx_cond = idx[:, -self.config.block_size:]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
 
-            if top_k > 0:
-                # Filter top_k
-                v, ix = torch.topk(logits, top_k)
-                probs = F.softmax(v, dim=-1)
-                logits = torch.zeros_like(logits).scatter_(1, ix, probs)
-
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
+
             idx = torch.cat((idx, idx_next), dim=1)
+
+            if end_token == idx_next:
+                break
         return idx
