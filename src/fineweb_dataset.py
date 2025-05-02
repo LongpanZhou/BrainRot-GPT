@@ -4,6 +4,7 @@ import numpy as np
 
 from tqdm import tqdm
 from datasets import load_dataset, load_from_disk
+
 # Code stolen from: https://github.com/karpathy/nanoGPT/blob/master/data/openwebtext/prepare.py#L45
 
 # Global constants
@@ -12,7 +13,7 @@ SAMPLE_NAME = "sample-10BT"                                                     
 ENCODER_NAME = "cl100k_base"                                                            # Encoder name
 PATH_NAME = os.path.join(os.path.dirname(__file__), f'{SAMPLE_NAME}_{ENCODER_NAME}')    # Path to save the dataset
 BATCH_SIZE = 1024                                                                       # Batch size for tokenization
-ALL_IN_ONE = True                                                                       # Save all data in one file.
+ALL_IN_ONE = False                                                                      # Save all data in one file. Set to True if you have enough memory
 
 # Download dataset - Does not show progress bar...
 print("Downloading dataset...")
@@ -52,7 +53,7 @@ for split, dset in tokenized.items():
 
     if ALL_IN_ONE:
         # ===============IF YOU HAVE ENOUGH MEMORY================
-        print("Saving the binary...")
+        print("Saving the binary... Please wait this could take a while...")
         dset = dset.with_format('numpy')
         arr = np.concatenate(dset['ids']).astype(np.uint32)
         arr.tofile(filename)
