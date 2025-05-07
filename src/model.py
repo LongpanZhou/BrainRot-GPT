@@ -8,7 +8,7 @@ from dataclasses import dataclass
 @dataclass
 class GPTConfig:
     block_size: int = 1024
-    vocab_size: int = 100277 #I used cl100k here
+    vocab_size: int = 100258        #I used cl100k here
     n_layers: int = 12
     n_embd: int = 768
     n_head: int = 12
@@ -33,7 +33,7 @@ class CasualSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
 
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and torch.cuda.is_available()
 
         if not self.flash:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
@@ -101,7 +101,7 @@ class GPT(nn.Module):
             )
         )
 
-        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=config.bias)
         self.transformer.wte.weight = self.lm_head.weight
 
         self.apply(self._init_weights)
@@ -148,16 +148,21 @@ class GPT(nn.Module):
         return logits, loss
 
     def generate(self, idx, max_new_tokens, temperature=1.0, end_token=None):
+        B, T = idx.size()
+        output = torch.zeros(B, T+max_new_tokens, dtype=idx.dtype, device=idx.device)
+        output[:, :T] = idx
+
         for _ in range(max_new_tokens):
-            idx_cond = idx[:, -self.config.block_size:]
+            idx_cond = output[:, max(0, T - self.config.block_size):T]
             logits, _ = self(idx_cond)
             logits = logits[:, -1, :] / temperature
 
             probs = F.softmax(logits, dim=-1)
             idx_next = torch.multinomial(probs, num_samples=1)
 
-            idx = torch.cat((idx, idx_next), dim=1)
+            output[:, T] = idx_next[:, 0]
+            T+=1
 
             if end_token == idx_next:
                 break
-        return idx
+        return output[:, :T]

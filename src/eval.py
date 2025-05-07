@@ -26,7 +26,7 @@ SEQUENCE_LENGTH = 512
 model = GPT(GPTConfig()).to(device)
 model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
-state_dict = torch.load('./checkpoints/last_ckpt.pth', map_location='cuda')
+state_dict = torch.load('checkpoints/last_ckpt_128M.pth', map_location='cuda')
 model.load_state_dict(state_dict['model_state_dict'])
 
 # Encoder
