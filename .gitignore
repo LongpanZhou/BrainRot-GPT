@@ -1,6 +1,7 @@
 #Binary files
 src/sample-10BT_cl100k_base/
 src/checkpoints/
+src/logs/
 src/train.bin
 src/test.bin
 qodana.yaml

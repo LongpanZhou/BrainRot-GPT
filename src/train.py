@@ -1,11 +1,14 @@
 import os
+import sys
 import time
 import torch
 import tiktoken
+import logging
 import numpy as np
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
+from datetime import datetime
 from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
@@ -31,6 +34,7 @@ EVAL_EVERY_STEPS = 100                      # Evaluate every N steps
 EVAL_ITERS = 10                             # Number of evaluation iterations
 SAVE_EVERY_STEPS = STEPS//10                # Save every N steps
 SAVE_DIR = "./checkpoints"                  # Directory to save checkpoints
+LOG_DIR = "./logs"                          # Directory to save logs
 CUDA_ENABLED = (device == "cuda")           # Use CUDA
 
 # Optimizations
@@ -43,22 +47,57 @@ if CUDA_ENABLED:
 # Tokenizer
 enc = tiktoken.get_encoding("cl100k_base")              # Tokenizer (same as dataloader.py)
 
+# Setup logging
+def setup_logging(ddp):
+    # Configure logging
+    log_idx = max([int(f.split(".")[0]) for f in os.listdir(LOG_DIR) if f.endswith(".log")], default=-1) + 1
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(message)s',
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler(os.path.join(LOG_DIR, f"{log_idx}.log"), mode='a'),
+        ]
+    )
+
+    # Start info
+    logging.info(f"{datetime.now()}")
+    logging.info(f"Distributed Data Parallel (DDP) mode: {ddp}")
+    logging.info(f"Using device: {device}")
+    logging.info("===== Training Configuration =====")
+    logging.info(f"BATCH_SIZE         = {BATCH_SIZE}")
+    logging.info(f"SEQUENCE_LENGTH    = {SEQUENCE_LENGTH}")
+    logging.info(f"STEPS              = {STEPS}")
+    logging.info(f"LEARNING_RATE      = {LEARNING_RATE}")
+    logging.info(f"WARMUP_STEPS       = {WARMUP_STEPS}")
+    logging.info(f"EVAL_EVERY_STEPS   = {EVAL_EVERY_STEPS}")
+    logging.info(f"EVAL_ITERS         = {EVAL_ITERS}")
+    logging.info(f"SAVE_EVERY_STEPS   = {SAVE_EVERY_STEPS}")
+    logging.info(f"SAVE_DIR           = {SAVE_DIR}")
+    logging.info(f"LOG_DIR            = {LOG_DIR}")
+    logging.info(f"CUDA_ENABLED       = {CUDA_ENABLED}")
+    logging.info("===================================")
+
 # DDP setup -> please ignore this if you are not using DDP
-def setup_ddp(rank, world_size):
+def setup_ddp(rank, world_size, GPU_ID):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
-    torch.cuda.set_device(rank)
+    torch.cuda.set_device(GPU_ID)
 
 # Main
-def main(rank, world_size, ddp, train_dataset, val_dataset):
+def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_device):
     try:
+        # Set current GPU_ID
+        GPU_ID = GPU_IDs[rank]
+
         # Setup DDP if enabled
         if ddp:
-            setup_ddp(rank, world_size)
+            setup_ddp(rank, world_size, GPU_ID)
 
         # Set device
-        local_device = torch.device(f"cuda:{rank}")
+        local_device = torch.device(f"cuda:{GPU_ID}")
+        is_master = (GPU_ID == master_device) if world_size > 1 else True
 
         # Model
         model = GPT(GPTConfig(
@@ -78,7 +117,7 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
 
         # DDP model wrapping
         if ddp:
-            model = DDP(model, device_ids=[rank], find_unused_parameters=True)
+            model = DDP(model, device_ids=[GPU_ID], find_unused_parameters=True)
             dist.barrier()
 
         # Optimizer and Scheduler
@@ -88,8 +127,11 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
 
         # Precompute random indices
         train_idx = np.random.randint(0, len(train_dataset), size=STEPS)
-        val_idx = np.random.randint(0, len(val_dataset), size=STEPS*EVAL_ITERS)
-        v_idx = 0
+
+        if is_master:
+            val_idx = np.random.randint(0, len(val_dataset), size=STEPS*EVAL_ITERS)
+            v_idx = 0
+            setup_logging(ddp)
 
         # Training Loop
         for step in range(STEPS):
@@ -113,17 +155,16 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
             scaler.update()
             scheduler.step()
 
-            # EVALUATE
-            if step % EVAL_EVERY_STEPS == 0:
-                if ddp:
-                    dist.barrier()  # Synchronize before evaluation
-
-                if rank == 0:       # Only rank 0 does evaluation
-                    start = time.time()
+            # ONLY MASTER
+            if is_master:
+                # Evaluate
+                if step % EVAL_EVERY_STEPS == 0:
+                    # Evaluation Mode
                     model.eval()
                     val_losses = []
 
                     # Evaluate on validation set
+                    # start = time.time()
                     with torch.no_grad():
                         for t in range(EVAL_ITERS):
                             x, y = val_dataset[val_idx[v_idx]]
@@ -137,22 +178,14 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                     avg_val_loss = sum(val_losses) / len(val_losses)
                     perplexity = torch.exp(torch.tensor(avg_val_loss))
 
-                    # Print information
-                    end = time.time()
-                    print(end - start)
-                    print(f"Step: {step}, Train Loss: {loss.item()}, Val Loss: {avg_val_loss}, "
+                    # Display information
+                    # end = time.time()
+                    # logging.info(end - start)
+                    logging.info(f"Step: {step}, Train Loss: {loss.item()}, Val Loss: {avg_val_loss}, "
                           f"Perplexity: {perplexity.item()}, Grad Norm: {grad_norm.item()}, lr: {scheduler.get_last_lr()[0]}")
 
-                    # Save checkpoint
-                    if step % SAVE_EVERY_STEPS == 0 and rank == 0:
-                        torch.save({
-                            'model_state_dict': model.module.state_dict() if ddp else model.state_dict(),
-                            'optimizer_state_dict': optimizer.state_dict(),
-                            'step': step,
-                        }, 'checkpoints/last_ckpt.pth')
-
                     # Generate text
-                    start = time.time()
+                    # start = time.time()
                     with torch.no_grad():
                         text = "Hello, how are you doing today? I hope you're having a great day!"
                         tokens = enc.encode(text)
@@ -167,46 +200,64 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                             temperature=1.0,
                             end_token=enc.eot_token,
                         )
-                    end = time.time()
-                    print(end-start)
-                    print(enc.decode(out[0].tolist()))
+                    # end = time.time()
+                    # logging.info(end-start)
+                    logging.info(enc.decode(out[0].tolist()))
+
+                # Save checkpoint
+                if step % SAVE_EVERY_STEPS == 0:
+                    torch.save({
+                        'step': step,
+                        'model_state_dict': model.module.state_dict() if ddp else model.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'scaler': scaler.state_dict(),
+                        'scheduler': scheduler.state_dict()
+                    }, 'checkpoints/last_ckpt.pth')
 
     # Handle exceptions
     except Exception as e:
-        print(f"Rank {rank}: Error occurred: {str(e)}")
+        logging.error(f"GPU {GPU_ID}: Error occurred: {str(e)}")
         raise
     # Ensure all processes exit
     finally:
+        # Destroy DDP process group
         if dist.is_initialized():
             dist.destroy_process_group()
+        # Cleanup CUDA memory
+        if CUDA_ENABLED:
+            torch.cuda.empty_cache()
 
 if __name__ == "__main__":
-    ddp = False  # Set this to False for single GPU training
-    print("Distributed Data Parallel (DDP) mode:", ddp)
-    print(f"Using device: {device}")
+    # Set this to False for single GPU training, True for DDP
+    ddp = False if torch.cuda.device_count() == 1 else True # or False
 
     # Create directories
     os.makedirs(SAVE_DIR, exist_ok=True)
+    os.makedirs(LOG_DIR, exist_ok=True)
+
+    # Load datasets
     train_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="train")
     val_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="test")
 
+    # Main function
     if ddp:
         GPU_IDS = [0, 1, 2, 3]  # Set your GPU IDs here
         world_size = len(GPU_IDS)
+        master_device = GPU_IDS[0]
 
         # Check if the requested GPUs are available
-        if world_size > torch.cuda.device_count():
-            raise ValueError(f"Requested {world_size} GPUs, but only {torch.cuda.device_count()} available")
+        assert world_size <= torch.cuda.device_count(), f"Requested {world_size} GPUs, but only {torch.cuda.device_count()} available"
+        assert world_size != 0, f"Requested {world_size} GPUs, but only {torch.cuda.device_count()} available"
 
         # DDP initialization
-        print(f"Starting DDP with {world_size} GPUs: {GPU_IDS}")
+        logging.info(f"Starting DDP with {world_size} GPUs: {GPU_IDS}")
         mp.set_start_method('spawn', force=True)
         mp.spawn(
             main,
-            args=(world_size, ddp, train_dataset, val_dataset),
+            args=(world_size, GPU_IDS, ddp, train_dataset, val_dataset, master_device),
             nprocs=world_size,
             join=True
         )
     else:
-        print("Starting single GPU training")
-        main(0, 1, ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
+        logging.info("Starting single GPU training")
+        main(0, 1, [0], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset, master_device=0)
