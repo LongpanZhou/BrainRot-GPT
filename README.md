@@ -67,8 +67,8 @@ torch.nn.parallel.DistributedDataParallel `[P+++++]`<br/> - Stands for `Distribu
 torch.backends.cudnn.benchmark `[P*+]` in LLM<br/> - Allows pytorch to auto tune CNN convolution algorithm.<br/><br/>
 torch.backends.cuda.matmul.allow_tf32 `[P++]`<br/> - Allows GPU to enable tf32 format in matmul requires GPU support.<br/><br/>
 torch.backends.cudnn.allow_tf32 `[P++]`<br/> - Allows GPU to enable tf32 format in general.<br/><br/>
-torch.set_float32_matmul_precision `[...]`<br/> - Set matmul precision trading speed for accuracy.<br/><br/>
-torch.compile `[P*+]`<br/> - Compile model into one to improve performance [P+++]. "max-autotune" or "reduce-overhead" are good, with the first one slightly faster.<br/><br/>
+torch.set_float32_matmul_precision `[P...P+++]`<br/> - Set matmul precision trading speed for accuracy.<br/><br/>
+torch.compile `[P+++]`<br/> - Compile model into one to improve performance. "max-autotune" or "reduce-overhead" are good, with the first one slightly faster.<br/><br/>
 torch.optim.AdamW `[P++]`<br/> - Fused speeds up the computation but requires GPU support.<br/><br/>
 torch.autocast `[P+++]`<br/> - Enable automatic mixed precision to float16 or bfloat16, saves massive computation and memory decrease accuracy.<br/><br/>
 
