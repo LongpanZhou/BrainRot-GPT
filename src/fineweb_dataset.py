@@ -11,9 +11,10 @@ from datasets import load_dataset, load_from_disk
 NUM_PROC = os.cpu_count()                                                               # Number of processes to use for tokenization
 SAMPLE_NAME = "sample-10BT"                                                             # Sample name from HuggingFaceFW/Fineweb dataset
 ENCODER_NAME = "cl100k_base"                                                            # Encoder name
+DATA_TYPE = np.uint32                                                                   # Data type for the tokenized dataset (must be greater than vocab_size from encoder)
 PATH_NAME = os.path.join(os.path.dirname(__file__), f'{SAMPLE_NAME}_{ENCODER_NAME}')    # Path to save the dataset
 BATCH_SIZE = 1024                                                                       # Batch size for tokenization
-ALL_IN_ONE = False                                                                      # Save all data in one file. Set to True if you have enough memory
+ALL_IN_ONE = False                                                                      # Save all data at once. (Not recommended for large datasets)
 
 # Download dataset - Does not show progress bar...
 print("Downloading dataset...")
@@ -60,7 +61,7 @@ for split, dset in tokenized.items():
     else:
         # ===============IF YOU DON'T HAVE ENOUGH MEMORY================
         arr_len = np.sum(dset['len'], dtype=np.uint64)
-        arr = np.memmap(filename, dtype=np.uint32, mode='w+', shape=(arr_len,))
+        arr = np.memmap(filename, dtype=DATA_TYPE, mode='w+', shape=(arr_len,))
 
         idx = 0
         for batch_idx in tqdm(range(BATCH_SIZE), desc=f'writing {filename}'):

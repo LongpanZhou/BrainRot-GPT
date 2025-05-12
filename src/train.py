@@ -21,54 +21,62 @@ elif torch.backends.mps.is_available():
 else:
     device = "cpu"
 
-# Optimizations
-if device == "cuda":
-    torch.backends.cudnn.benchmark = True
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
-    torch.set_float32_matmul_precision("medium")
-
 # Hyperparameters
-BATCH_SIZE = 64
-SEQUENCE_LENGTH = 512
-STEPS = 20000
-LEARNING_RATE = 4e-4
-WARMUP_STEPS = STEPS // 1000
-EVAL_EVERY_STEPS = 100
-EVAL_ITERS = 10
-SAVE_EVERY_STEPS = STEPS//10
-SAVE_DIR = "./checkpoints"
-CUDA_ENABLED = (device == "cuda")
+BATCH_SIZE = 64                             # Batch size
+SEQUENCE_LENGTH = 512                       # Sequence length
+STEPS = 20000                               # Total training steps
+LEARNING_RATE = 1e-3                        # Learning rate             <- Your model might explode due to higher lr (This might because of Mixed Precision)
+WARMUP_STEPS = STEPS // 1000                # Warmup steps
+EVAL_EVERY_STEPS = 100                      # Evaluate every N steps
+EVAL_ITERS = 10                             # Number of evaluation iterations
+SAVE_EVERY_STEPS = STEPS//10                # Save every N steps
+SAVE_DIR = "./checkpoints"                  # Directory to save checkpoints
+CUDA_ENABLED = (device == "cuda")           # Use CUDA
+
+# Optimizations
+if CUDA_ENABLED:
+    torch.backends.cudnn.benchmark = True               # Enable cuDNN auto-tuner
+    torch.backends.cuda.matmul.allow_tf32 = True        # Enable TensorFloat-32 for matmul
+    torch.backends.cudnn.allow_tf32 = True              # Enable TensorFloat-32 for cuDNN
+    torch.set_float32_matmul_precision("medium")        # Set float32 matmul precision to medium
 
 # Tokenizer
-enc = tiktoken.get_encoding("cl100k_base")
+enc = tiktoken.get_encoding("cl100k_base")              # Tokenizer (same as dataloader.py)
 
+# DDP setup -> please ignore this if you are not using DDP
 def setup_ddp(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
     dist.init_process_group(backend='nccl', rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
+# Main
 def main(rank, world_size, ddp, train_dataset, val_dataset):
     try:
         # Setup DDP if enabled
         if ddp:
             setup_ddp(rank, world_size)
+
+        # Set device
         local_device = torch.device(f"cuda:{rank}")
 
         # Model
         model = GPT(GPTConfig(
-            # block_size= 512,
+            # block_size= 512,     # sequence length
             # vocab_size= 100258,  # using cl100k_base tokenizer
             # n_layers= 36,        # depth
             # n_embd= 1280,        # hidden size
             # n_head= 20,          # attention heads
-            dropout= 0.1,
-            # bias=True
+            dropout= 0.1,          # dropout rate
+            # bias= True,          # use bias
+            # GQA= True,           # GQA model
         )).to(local_device)
 
-        if device == "cuda":
+        # Compile model if CUDA is enabled
+        if CUDA_ENABLED:
             model = torch.compile(model, mode="max-autotune", fullgraph=True)
+
+        # DDP model wrapping
         if ddp:
             model = DDP(model, device_ids=[rank], find_unused_parameters=True)
             dist.barrier()
@@ -89,7 +97,7 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
             x, y = train_dataset[train_idx[step]]
             x, y = x.to(local_device, non_blocking=True), y.to(local_device, non_blocking=True)
 
-            # TRAIN
+            # Train step
             model.train()
             optimizer.zero_grad()
 
@@ -110,10 +118,12 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                 if ddp:
                     dist.barrier()  # Synchronize before evaluation
 
-                if rank == 0:  # Only rank 0 does evaluation
+                if rank == 0:       # Only rank 0 does evaluation
                     start = time.time()
                     model.eval()
                     val_losses = []
+
+                    # Evaluate on validation set
                     with torch.no_grad():
                         for t in range(EVAL_ITERS):
                             x, y = val_dataset[val_idx[v_idx]]
@@ -122,12 +132,16 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                                 _, loss = model(x, y)
                             val_losses.append(loss.item())
                             v_idx += 1
+
+                    # Calculate average validation loss and perplexity
                     avg_val_loss = sum(val_losses) / len(val_losses)
                     perplexity = torch.exp(torch.tensor(avg_val_loss))
+
+                    # Print information
                     end = time.time()
                     print(end - start)
                     print(f"Step: {step}, Train Loss: {loss.item()}, Val Loss: {avg_val_loss}, "
-                          f"Perplexity: {perplexity.item()}, Grad Norm: {grad_norm.item()}")
+                          f"Perplexity: {perplexity.item()}, Grad Norm: {grad_norm.item()}, lr: {scheduler.get_last_lr()[0]}")
 
                     # Save checkpoint
                     if step % SAVE_EVERY_STEPS == 0 and rank == 0:
@@ -137,8 +151,8 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                             'step': step,
                         }, 'checkpoints/last_ckpt.pth')
 
-                    start = time.time()
                     # Generate text
+                    start = time.time()
                     with torch.no_grad():
                         text = "Hello, how are you doing today? I hope you're having a great day!"
                         tokens = enc.encode(text)
@@ -157,10 +171,11 @@ def main(rank, world_size, ddp, train_dataset, val_dataset):
                     print(end-start)
                     print(enc.decode(out[0].tolist()))
 
-
+    # Handle exceptions
     except Exception as e:
         print(f"Rank {rank}: Error occurred: {str(e)}")
         raise
+    # Ensure all processes exit
     finally:
         if dist.is_initialized():
             dist.destroy_process_group()
@@ -170,6 +185,7 @@ if __name__ == "__main__":
     print("Distributed Data Parallel (DDP) mode:", ddp)
     print(f"Using device: {device}")
 
+    # Create directories
     os.makedirs(SAVE_DIR, exist_ok=True)
     train_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="train")
     val_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="test")
@@ -178,9 +194,11 @@ if __name__ == "__main__":
         GPU_IDS = [0, 1, 2, 3]  # Set your GPU IDs here
         world_size = len(GPU_IDS)
 
+        # Check if the requested GPUs are available
         if world_size > torch.cuda.device_count():
             raise ValueError(f"Requested {world_size} GPUs, but only {torch.cuda.device_count()} available")
 
+        # DDP initialization
         print(f"Starting DDP with {world_size} GPUs: {GPU_IDS}")
         mp.set_start_method('spawn', force=True)
         mp.spawn(
