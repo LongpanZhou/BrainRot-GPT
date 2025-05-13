@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024          # The maximum context length
+    block_size: int = 512           # The maximum context length
     vocab_size: int = 100258        # The size of the vocabulary (same as the tokenizer)
     n_layers: int = 12              # The number of transformer blocks
     n_embd: int = 768               # The size of the embedding dimension
@@ -18,11 +18,11 @@ class GPTConfig:
 class CasualSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Variables
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.h_dim = config.n_embd // config.n_head
         self.bias = config.bias
         self.dropout = config.dropout
 
@@ -34,6 +34,7 @@ class CasualSelfAttention(nn.Module):
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
 
+        # Flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and torch.cuda.is_available()
 
         if not self.flash:
@@ -46,13 +47,13 @@ class CasualSelfAttention(nn.Module):
 
         # Set Q, K, V
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
+        q = q.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
+        k = k.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
+        v = v.view(B, T, self.n_head, self.h_dim ).transpose(1, 2) #( B, n_head, T, h_dim)
 
         # Flash attention
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         # Regular attention
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -98,6 +99,7 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+        assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Initialize the model
         print("Creating Model...")
@@ -118,14 +120,29 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
         self.c_proj = nn.Linear(4 * self.config.n_embd, self.config.n_embd, bias=self.config.bias)
 
-    def forward(self, idx, targets=None):
+        # init all weights
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.n_layers))
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, x, targets=None):
         # Batch size and sequence length
-        B, T = idx.size()
+        B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
 
         # Token Embedding and positional encoding
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        tok_emb = self.transformer.wte(idx) # (B, T, C)
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        tok_emb = self.transformer.wte(x) # (B, T, C)
         pos_emb = self.transformer.wpe(pos) # (1, T, C)
 
         # Add token and positional embeddings with dropouts
@@ -150,31 +167,31 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    def generate(self, idx, max_new_tokens, temperature=1.0, end_token=None):
+    @torch.no_grad()
+    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None):
         # Batch size and sequence length
-        B, T = idx.size()
+        B, T = x.size()
 
         # Preallocate output tensor -> Optimization
-        output = torch.zeros(B, T+max_new_tokens, dtype=idx.dtype, device=idx.device)
-        output[:, :T] = idx
+        output = torch.zeros(B, T+max_new_tokens, dtype=x.dtype, device=x.device)
+        output[:, :T] = x
 
         # Generation loop
         for _ in range(max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            idx_cond = output[:, max(0, T - self.config.block_size):T]
-            logits, _ = self(idx_cond)
+            logits, _ = self(output[:, max(0, T - self.config.block_size):T])
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            x_next = torch.multinomial(probs, num_samples=1)
 
             # Append the sampled token to the output
-            output[:, T] = idx_next[:, 0]
+            output[:, T] = x_next[:, 0]
             T+=1
 
             # Check for end token
-            if end_token == idx_next:
+            if end_token == x_next:
                 break
 
         # Update the output tensor up to last token

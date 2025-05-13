@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
-    block_size: int = 1024          # The maximum context length
+    block_size: int = 512           # The maximum context length
     vocab_size: int = 100258        # The size of the vocabulary (same as the tokenizer)
     n_layers: int = 12              # The number of transformer blocks
     n_embd: int = 768               # The size of the embedding dimension
@@ -15,22 +15,149 @@ class GPTConfig:
     dropout: float = 0.0            # The dropout probability
     bias: bool = True               # Whether to use bias
     GQA: bool = True                # Whether to use GQA (Grouped Query Attention)
+    GQA_factor = 4                  # The factor for GQA
+    ROPE: bool = True               # Whether to use ROPE (Rotary Positional Embedding)
+
+# Code from torchtune -> some reason importing it breaks my logging
+class RotaryPositionalEmbeddings(nn.Module):
+    """
+    This class implements Rotary Positional Embeddings (RoPE)
+    proposed in https://arxiv.org/abs/2104.09864.
+
+    Reference implementation (used for correctness verification)
+    can be found here:
+    https://github.com/meta-llama/llama/blob/main/llama/model.py#L80
+
+    In this implementation we cache the embeddings for each position upto
+    ``max_seq_len`` by computing this during init.
+
+    Args:
+        dim (int): Embedding dimension. This is usually set to the dim of each
+            head in the attention module computed as ``embed_dim // num_heads``
+        max_seq_len (int): Maximum expected sequence length for the
+            model, if exceeded the cached freqs will be recomputed
+        base (int): The base for the geometric progression used to compute
+            the rotation angles
+    """
+
+    def __init__(
+            self,
+            dim: int,
+            max_seq_len: int = 4096,
+            base: int = 10_000,
+    ) -> None:
+        super().__init__()
+        self.dim = dim
+        self.base = base
+        self.max_seq_len = max_seq_len
+        self.rope_init()
+
+    def rope_init(self):
+        theta = 1.0 / (
+                self.base
+                ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
+        )
+        self.register_buffer("theta", theta, persistent=False)
+        self.build_rope_cache(self.max_seq_len)
+
+    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
+        # Create position indexes `[0, 1, ..., max_seq_len - 1]`
+        seq_idx = torch.arange(
+            max_seq_len, dtype=self.theta.dtype, device=self.theta.device
+        )
+
+        # Outer product of theta and position index; output tensor has
+        # a shape of [max_seq_len, dim // 2]
+        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float()
+
+        # cache includes both the cos and sin components and so the output shape is
+        # [max_seq_len, dim // 2, 2]
+        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
+        self.register_buffer("cache", cache, persistent=False)
+
+    def forward(
+            self, x: torch.Tensor, *, input_pos: torch.Tensor = None
+    ) -> torch.Tensor:
+        """
+        Args:
+            x (torch.Tensor): input tensor with shape
+                ``[b, s, n_h, h_d]``
+            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
+                of each token. During training, this is used to indicate the positions
+                of each token relative to its sample when packed, shape [b, s].
+                During inference, this indicates the position of the current token.
+                If none, assume the index of the token is its position id. Default is None.
+
+        Returns:
+            torch.Tensor: output tensor with shape ``[b, s, n_h, h_d]``
+
+        Notation used for tensor shapes:
+            - b: batch size
+            - s: sequence length
+            - n_h: num heads
+            - h_d: head dim
+        """
+        # input tensor has shape [b, s, n_h, h_d]
+        seq_len = x.size(1)
+
+        # extract the values based on whether input_pos is set or not
+        rope_cache = (
+            self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
+        )
+
+        # reshape input; the last dimension is used for computing the output.
+        # Cast to float to match the reference implementation
+        # tensor has shape [b, s, n_h, h_d // 2, 2]
+        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
+
+        # reshape the cache for broadcasting
+        # tensor has shape [b, s, 1, h_d // 2, 2] if packed samples,
+        # otherwise has shape [1, s, 1, h_d // 2, 2]
+        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
+
+        # tensor has shape [b, s, n_h, h_d // 2, 2]
+        x_out = torch.stack(
+            [
+                xshaped[..., 0] * rope_cache[..., 0]
+                - xshaped[..., 1] * rope_cache[..., 1],
+                xshaped[..., 1] * rope_cache[..., 0]
+                + xshaped[..., 0] * rope_cache[..., 1],
+                ],
+            -1,
+        )
+
+        # tensor has shape [b, s, n_h, h_d]
+        x_out = x_out.flatten(3)
+        return x_out.type_as(x)
+
 
 class CasualSelfAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Variables
         self.n_head = config.n_head
         self.n_embd = config.n_embd
+        self.h_dim = config.n_embd // config.n_head
         self.bias = config.bias
         self.dropout = config.dropout
         self.GQA = config.GQA
+        self.GQA_factor = config.GQA_factor
+        self.ROPE = config.ROPE
 
         # Linear Projections
-        self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=self.bias)
+        if self.GQA:
+            assert self.n_embd % self.GQA_factor == 0, "Embedding dimension must be divisible by GQA factor"
+            KV_dim = self.n_embd // self.GQA_factor
+            self.c_attn_q = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
+            self.c_attn_k = nn.Linear(self.n_embd, KV_dim, bias=self.bias)
+            self.c_attn_v = nn.Linear(self.n_embd, KV_dim, bias=self.bias)
+        else:
+            self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=self.bias)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
+
+        # Rotary Positional Embeddings
+        if self.ROPE: self.rope = RotaryPositionalEmbeddings(dim=self.h_dim,max_seq_len=config.block_size,base=10000)
 
         # Regularization
         self.attn_dropout = nn.Dropout(self.dropout)
@@ -39,7 +166,6 @@ class CasualSelfAttention(nn.Module):
         # Flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and torch.cuda.is_available()
 
-        # Register buffer for attention mask
         if not self.flash:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
@@ -49,16 +175,30 @@ class CasualSelfAttention(nn.Module):
         B, T, C = x.size()
 
         # Set Q, K, V
-        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) #( B, n_head, T, C // n_head)
+        if self.GQA:
+            q = self.c_attn_q(x).view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
+            k = self.c_attn_k(x).view(B, T, self.n_head // self.GQA_factor, self.h_dim).transpose(1, 2) #( B, n_head//GQA_factor, T, h_dim)
+            v = self.c_attn_v(x).view(B, T, self.n_head // self.GQA_factor, self.h_dim).transpose(1, 2) #( B, n_head//GQA_factor, T, h_dim)
+        else:
+            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
+            q = q.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
+            k = k.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
+            v = v.view(B, T, self.n_head, self.h_dim ).transpose(1, 2) #( B, n_head, T, h_dim)
+
+        # ROPE
+        if self.ROPE:
+            q = self.rope(q)
+            k = self.rope(k)
 
         # Flash attention
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout, is_causal=True, enable_gqa=self.GQA)
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, enable_gqa=self.GQA)
         # Regular attention
         else:
+            if self.GQA:
+                k = k.repeat_interleave(q.size(-3)//k.size(-3), -3)
+                v = v.repeat_interleave(q.size(-3)//v.size(-3), -3)
+
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
@@ -74,14 +214,15 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         # Layers
-        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.gelu = nn.GELU(approximate='tanh')
-        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_gate_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.c_down_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.c_up_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.silu = nn.SiLU()
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         # Feedforward pass
-        return self.dropout(self.c_proj(self.gelu(self.c_fc(x))))
+        return self.dropout(self.c_down_proj(self.silu(self.c_up_proj(x)) * self.c_gate_proj(x)))
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -102,6 +243,7 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         self.config = config
+        assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Initialize the model
         print("Creating Model...")
@@ -122,17 +264,30 @@ class GPT(nn.Module):
         self.transformer.wte.weight = self.lm_head.weight
         self.c_proj = nn.Linear(4 * self.config.n_embd, self.config.n_embd, bias=self.config.bias)
 
-    def forward(self, idx, targets=None):
+        # init all weights
+        self.apply(self._init_weights)
+        for pn, p in self.named_parameters():
+            if pn.endswith('c_proj.weight'):
+                torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * self.config.n_layers))
+
+    @staticmethod
+    def _init_weights(module):
+        if isinstance(module, nn.Linear):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+
+    def forward(self, x, targets=None):
         # Batch size and sequence length
-        B, T = idx.size()
+        B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
 
         # Token Embedding and positional encoding
-        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)
-        tok_emb = self.transformer.wte(idx) # (B, T, C)
+        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        tok_emb = self.transformer.wte(x) # (B, T, C)
         pos_emb = self.transformer.wpe(pos) # (1, T, C)
-
-        # ROPE (rotate positional encoding)
 
         # Add token and positional embeddings with dropouts
         x = self.transformer.drop(tok_emb + pos_emb)
@@ -157,46 +312,31 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, idx, max_new_tokens, temperature=1.0, end_token=None):
+    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None):
         # Batch size and sequence length
-        B, T = idx.size()
+        B, T = x.size()
 
         # Preallocate output tensor -> Optimization
-        output = torch.zeros(B, T+max_new_tokens, dtype=idx.dtype, device=idx.device)
-        output[:, :T] = idx
+        output = torch.zeros(B, T+max_new_tokens, dtype=x.dtype, device=x.device)
+        output[:, :T] = x
 
         # Generation loop
         for _ in range(max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            idx_cond = output[:, max(0, T - self.config.block_size):T]
-            logits, _ = self(idx_cond)
+            logits, _ = self(output[:, max(0, T - self.config.block_size):T])
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution
             probs = F.softmax(logits, dim=-1)
-            idx_next = torch.multinomial(probs, num_samples=1)
+            x_next = torch.multinomial(probs, num_samples=1)
 
             # Append the sampled token to the output
-            output[:, T] = idx_next[:, 0]
+            output[:, T] = x_next[:, 0]
             T+=1
 
             # Check for end token
-            if end_token == idx_next:
+            if end_token == x_next:
                 break
 
         # Update the output tensor up to last token
         return output[:, :T]
-
-    @torch.no_grad()
-    def _rope_init(self):
-        # Initialize the ROPE (Rotate Positional Encoding) weights
-        head_dim = self.config.n_embd // self.config.n_head
-        device = self.transformer.wpe.weight.device
-        assert head_dim%2 == 0, "Head dimension(n_embd//n_head) must be even for ROPE"
-
-        # theta = 10000^(-2*i/d)) where i = 0....d//2 - 1
-        theta = 1.0 / (10000.0 ** (torch.arange(0, head_dim, 2, dtype=torch.float32, device=device) / head_dim))
-
-        # Compute frequency matrix
-        m = torch.arange(0, self.config.block_size, dtype=torch.float32, device=device)
-        freq = torch.outer(m,theta)

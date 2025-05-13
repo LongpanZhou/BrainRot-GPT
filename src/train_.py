@@ -9,12 +9,11 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from datetime import datetime
-from torch.amp import GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from dataloader import FineWeb
-from model import GPT, GPTConfig
+from model_ import GPT, GPTConfig
 
 # Device configuration
 if torch.cuda.is_available():
@@ -28,7 +27,7 @@ else:
 BATCH_SIZE = 64                             # Batch size
 SEQUENCE_LENGTH = 512                       # Sequence length
 STEPS = 20000                               # Total training steps
-LEARNING_RATE = 7e-4                        # Learning rate             <- Your model might explode due to higher lr (This might because of Mixed Precision)
+LEARNING_RATE = 1e-3                       # Learning rate
 WARMUP_STEPS = STEPS // 1000                # Warmup steps
 EVAL_EVERY_STEPS = 100                      # Evaluate every N steps
 EVAL_ITERS = 10                             # Number of evaluation iterations
@@ -36,17 +35,10 @@ SAVE_EVERY_STEPS = STEPS//10                # Save every N steps
 SAVE_DIR = "./checkpoints"                  # Directory to save checkpoints
 LOG_DIR = "./logs"                          # Directory to save logs
 CUDA_ENABLED = (device == "cuda")           # Use CUDA
-
-# Optimizations
-if CUDA_ENABLED:
-    torch.backends.cudnn.enabled = True                 # Enable cuDNN
-    torch.backends.cudnn.benchmark = True               # Enable cuDNN auto-tuner
-    torch.backends.cuda.matmul.allow_tf32 = True        # Enable TensorFloat-32 for matmul
-    torch.backends.cudnn.allow_tf32 = True              # Enable TensorFloat-32 for cuDNN
-    torch.set_float32_matmul_precision("medium")        # Set float32 matmul precision to medium
+DTYPE = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16 # Default dtype for CUDA
 
 # Tokenizer
-enc = tiktoken.get_encoding("cl100k_base")              # same as dataloader.py
+enc = tiktoken.get_encoding("cl100k_base")              #same as dataloader.py
 
 # Setup logging
 def setup_logging(ddp):
@@ -99,7 +91,9 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
         # Set device
         local_device = torch.device(f"cuda:{GPU_ID}")
         is_master = True if world_size == 1 else (GPU_ID == master_device)
-        amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+        # Setup logging
+        if is_master: setup_logging(ddp)
 
         # Model
         model = GPT(GPTConfig(
@@ -108,13 +102,15 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
             # n_layers = 36,        # depth
             # n_embd = 1280,        # embedding size
             # n_head = 20,          # attention heads
-            dropout = 0.1,          # dropout rate
+            # dropout = 0.1,        # dropout rate
             # bias = True,          # bias
-        )).to(device=local_device)
+            # GQA = False,          # GQA
+            # ROPE = True,          # ROPE
+        )).to(dtype=DTYPE, device=local_device)
 
         # Compile model if CUDA is enabled
         if CUDA_ENABLED:
-            model = torch.compile(model, mode="max-autotune", fullgraph=True)
+            model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
 
         # DDP model wrapping
         if ddp:
@@ -124,7 +120,6 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
         # Optimizer and Scheduler
         optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, fused=CUDA_ENABLED)
         scheduler = CosineAnnealingLR(optimizer, T_max=STEPS, eta_min=1e-5)
-        scaler = GradScaler(enabled=CUDA_ENABLED)
 
         # Precompute random indices
         train_idx = np.random.randint(0, len(train_dataset), size=STEPS)
@@ -132,7 +127,6 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
         if is_master:
             val_idx = np.random.randint(0, len(val_dataset), size=STEPS*EVAL_ITERS)
             v_idx = 0
-            setup_logging(ddp)
 
         # Training Loop
         for step in range(STEPS):
@@ -145,15 +139,13 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
             optimizer.zero_grad()
 
             # Forward pass
-            with torch.autocast(device_type="cuda", enabled=CUDA_ENABLED, dtype=amp_dtype):
+            with torch.autocast(device_type="cuda", enabled=CUDA_ENABLED, dtype=DTYPE):
                 _, loss = model(x, y)
 
             # Backward pass with mixed precision
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
 
             # ONLY MASTER
@@ -170,8 +162,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
                         for t in range(EVAL_ITERS):
                             x, y = val_dataset[val_idx[v_idx]]
                             x, y = x.to(local_device, non_blocking=True), y.to(local_device, non_blocking=True)
-                            with torch.autocast(device_type="cuda", enabled=CUDA_ENABLED, dtype=amp_dtype):
-                                _, loss = model(x, y)
+                            _, loss = model(x, y)
                             val_losses.append(loss.item())
                             v_idx += 1
 
@@ -183,7 +174,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
                     # end = time.time()
                     # logging.info(end - start)
                     logging.info(f"Step: {step}, Train Loss: {loss.item()}, Val Loss: {avg_val_loss}, "
-                          f"Perplexity: {perplexity.item()}, Grad Norm: {grad_norm.item()}, lr: {scheduler.get_last_lr()[0]}")
+                                 f"Perplexity: {perplexity.item()}, Grad Norm: {grad_norm.item()}, lr: {scheduler.get_last_lr()[0]}")
 
                     # Generate text
                     # start = time.time()
@@ -211,7 +202,6 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset, master_devi
                         'step': step,
                         'model_state_dict': model.module.state_dict() if ddp else model.state_dict(),
                         'optimizer_state_dict': optimizer.state_dict(),
-                        'scaler': scaler.state_dict(),
                         'scheduler': scheduler.state_dict()
                     }, 'checkpoints/last_ckpt.pth')
 

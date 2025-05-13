@@ -5,16 +5,16 @@
 > [!IMPORTANT]
 > *If you like this project, or find this project helpful, please give me a star. Thank you!* <br/><br/>
 > The original training was done on 4 × H100 80GB GPUs. With DDP enabled, it roughly takes about 12 hours to complete training. <br/>
-> You can run the model with less powerful setup, but since this project is not yet done there is no weights realeased. <br/>
+> You can run the model with less powerful setup, but since this project is not yet done there is no weights released. <br/>
 
 > [!NOTE]
 > If you have any questions or suggestions, please feel free to open an issue or pull request. <br/>
-> This project covers useful infomrations about a self implemented GPT model <br/>
+> This project covers useful information about a self implemented GPT model <br/>
 
 ## Structure
 - `fineweb_dataset.py` — Downloads the FineWeb dataset from HuggingFace, splits it, and encodes it into binary format
 - `dataloader.py` — Implements a Dataset class for loading binary files as torch tensors
-- `model.py` — Stanard implementation of GPT model
+- `model.py` — Standard implementation of GPT model
 - `model_.py` (INCOMPLETE) — Optimized implementation of GPT model
 - `train.py` — Handles model training, including optimization and checkpointing
 - `eval.py` (INCOMPLETE) — Loads a trained model and generates sample outputs for evaluation
@@ -39,7 +39,7 @@ This version has minimal changes from the original GPT-2 model:
 
 - [x] GELU - 'tanh' performance optimization  `[P+, L*-]` <br/> Tanh approx allows faster calculation with minimal loss to accuracy
 
-- [x] Attention Block - Pre-norm instead of Post-norm  `[L+]` <br/> Pre-norm generally yeilds better loss compare with Post-norm
+- [x] Attention Block - Pre-norm instead of Post-norm  `[L+]` <br/> Pre-norm generally yields better loss compare with Post-norm
 
 - [x] Encoder - "cl100k_base" Tokenizer  `[P--, L++]` <br/> Upsizing vocab_size and better encoding can result in better relative loss
 
@@ -52,13 +52,15 @@ This version focuses on improvements over the standard model.
 
 - [x] Causal Attention - Grouped Query Attention  `[P+++, L-]` <br/> Saves massive amount of memory for worse loss, this can be covered by scaling up parameters
 
-- [ ] Attention Block - RSM Norm  `[P+, L*+]` <br/> RSM Norm does less computation, yeilds better result in most cases
+- [x] Attention Block - RSM Norm  `[P+, L*+]` <br/> RSM Norm does less computation, yields better result in most cases
 
-- [ ] Positional Embedding - ROPE  `[P-, L++]` <br/> ROPE Embedding allows more accurate positional embedding
+- [x] Positional Embedding - ROPE  `[P-, L++]` <br/> ROPE Embedding allows more accurate positional embedding
 
-- [ ] Forward - K,V Caching  `[P+]` <br/> K, V caching avoid redendent computation, but takes more memory space
+- [ ] Forward - K,V Caching  `[P+]` <br/> K, V caching avoid redundant computation, but takes more memory space
 
-- [ ] MLP - SwiGLU  `[P-, L+]` <br/> Smoother GELU activiation, not sure why it is better
+- [x] MLP - SwiGLU  `[P-, L+]` <br/> Smoother GELU activation, not sure why it is better
+
+- [x] Bfloat16 `[P+, L-]` <br/> Bfloat16 allows scale up of parameters
 
 - [ ] MOE `[P++,L++]` <- I have no idea how to do this yet
 
@@ -79,6 +81,6 @@ The final product should talk in Gen-Z terms towards given prompt, hence the nam
 - [x] Finish Working GPT Model
 - [ ] Implement optimized version of Model
 - [ ] Set up own scrapper for custom dataset (reddit comments)
-- [ ] Train/Finetune for BrainRot GPT
+- [ ] LORA finetune for BrainRot GPT
 - [ ] Test and release
 - [ ] Custom Tokenizer <- not sure if needed
