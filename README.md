@@ -56,22 +56,22 @@ This version focuses on improvements over the standard model.
 
 - [x] Positional Embedding - ROPE  `[P-, L++]` <br/> ROPE Embedding allows more accurate positional embedding
 
-- [ ] Forward - K,V Caching  `[P+]` <br/> K, V caching avoid redundant computation, but takes more memory space
+- [x] Optimizer - RAdam `[P-, L+++]` <br/> RAdam is a better version of Adam, it is more stable.
 
 - [x] MLP - SwiGLU  `[P-, L+]` <br/> Smoother GELU activation, not sure why it is better
 
-- [x] Bfloat16 `[P+, L-]` <br/> Bfloat16 allows scale up of parameters
+- [ ] Forward - K,V Caching  `[P+]` <br/> K, V caching avoid redundant computation, but takes more memory space
 
 - [ ] MOE `[P++,L++]` <- I have no idea how to do this yet
 
 ### CUDA Optimizations
+**Note**: Some of these optimizations might be automatically turned on, or might overlap with each other.
 torch.nn.parallel.DistributedDataParallel `[P+++++]`<br/> - Stands for `Distributed Data Parallel`, allows multiple nodes, gpus in each node to work together.<br/><br/>
 torch.backends.cudnn.benchmark `[P*+]` in LLM<br/> - Allows pytorch to auto tune CNN convolution algorithm.<br/><br/>
 torch.backends.cuda.matmul.allow_tf32 `[P++]`<br/> - Allows GPU to enable tf32 format in matmul requires GPU support.<br/><br/>
-torch.backends.cudnn.allow_tf32 `[P++]`<br/> - Allows GPU to enable tf32 format in general.<br/><br/>
-torch.set_float32_matmul_precision `[P...P+++]`<br/> - Set matmul precision trading speed for accuracy.<br/><br/>
-torch.compile `[P+++]`<br/> - Compile model into one to improve performance. "max-autotune" or "reduce-overhead" are good, with the first one slightly faster.<br/><br/>
-torch.optim.AdamW `[P++]`<br/> - Fused speeds up the computation but requires GPU support.<br/><br/>
+torch.set_float32_matmul_precision `[P...P++]`<br/> - Set matmul precision trading speed for accuracy.<br/><br/>
+torch.optim.AdamW `[P*+]`<br/> - Fused speeds up the computation but requires GPU support.<br/><br/>
+torch.compile `[P+++]`<br/> - Compile model into one to improve performance.<br/><br/>
 torch.autocast `[P+++]`<br/> - Enable automatic mixed precision to float16 or bfloat16, saves massive computation and memory decrease accuracy.<br/><br/>
 
 ## Goal

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
-    block_size: int = 512           # The maximum context length
+    block_size: int = 1024          # The maximum context length
     vocab_size: int = 100258        # The size of the vocabulary (same as the tokenizer)
     n_layers: int = 12              # The number of transformer blocks
     n_embd: int = 768               # The size of the embedding dimension
@@ -102,7 +102,6 @@ class GPT(nn.Module):
         assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Initialize the model
-        print("Creating Model...")
         self.transformer = nn.ModuleDict(
             dict(
                 wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),             # Token embedding
@@ -116,9 +115,8 @@ class GPT(nn.Module):
         # I don't get how their weights is the same between nn.Embedding and nn.Linear, but the abstract idea.
         # You use the same projection input -> embedding and embedding -> output.
         # Meaning same embedding weights for both to keep it consistent. f(x) & f^-1(x)
-        self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=self.config.bias)
+        self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
-        self.c_proj = nn.Linear(4 * self.config.n_embd, self.config.n_embd, bias=self.config.bias)
 
         # init all weights
         self.apply(self._init_weights)
@@ -135,6 +133,20 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters()) - self.transformer.wpe.weight.numel()
+
+    def configure_optimizers(self, weight_decay, learning_rate):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=True)
+
     def forward(self, x, targets=None):
         # Batch size and sequence length
         B, T = x.size()
@@ -144,8 +156,6 @@ class GPT(nn.Module):
         pos = torch.arange(0, T, dtype=torch.long, device=x.device)
         tok_emb = self.transformer.wte(x) # (B, T, C)
         pos_emb = self.transformer.wpe(pos) # (1, T, C)
-
-        # Add token and positional embeddings with dropouts
         x = self.transformer.drop(tok_emb + pos_emb)
 
         # Transformer blocks

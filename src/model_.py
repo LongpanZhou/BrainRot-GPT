@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 @dataclass
 class GPTConfig:
-    block_size: int = 512           # The maximum context length
+    block_size: int = 1024          # The maximum context length
     vocab_size: int = 100258        # The size of the vocabulary (same as the tokenizer)
     n_layers: int = 12              # The number of transformer blocks
     n_embd: int = 768               # The size of the embedding dimension
@@ -18,7 +18,8 @@ class GPTConfig:
     GQA_factor = 4                  # The factor for GQA
     ROPE: bool = True               # Whether to use ROPE (Rotary Positional Embedding)
 
-# Code from torchtune -> some reason importing it breaks my logging
+
+# Code stolen from https://github.com/pytorch/torchtune/blob/main/torchtune/modules/position_embeddings.py
 class RotaryPositionalEmbeddings(nn.Module):
     """
     This class implements Rotary Positional Embeddings (RoPE)
@@ -130,6 +131,67 @@ class RotaryPositionalEmbeddings(nn.Module):
         x_out = x_out.flatten(3)
         return x_out.type_as(x)
 
+#Code stolen from https://github.com/pytorch/torchtune/blob/main/torchtune/modules/kv_cache.py
+class KVCache(nn.Module):
+    """
+    Standalone ``nn.Module`` containing a kv-cache to cache past key and values during inference.
+
+    Args:
+        batch_size (int): batch size model will be run with
+        max_seq_len (int): maximum sequence length model will be run with
+        num_heads (int): number of heads. We take num_heads instead of num_kv_heads because
+            the cache is created after we've expanded the key and value tensors to have the
+            same shape as the query tensor. See attention.py for more details
+        head_dim (int): per-attention head embedding dimension
+        dtype (torch.dtype): dtype for the caches
+    """
+
+    def __init__(
+            self,
+            batch_size: int,
+            max_seq_len: int,
+            num_heads: int,
+            head_dim: int,
+            dtype: torch.dtype,
+    ) -> None:
+        super().__init__()
+        cache_shape = (batch_size, num_heads, max_seq_len, head_dim)
+        self.register_buffer(
+            "k_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+        )
+        self.register_buffer(
+            "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+        )
+        self.batch_size = batch_size
+
+    def reset(self) -> None:
+        """Reset the cache to zero."""
+        self.k_cache.zero_()
+        self.v_cache.zero_()
+
+
+    def update(self, input_pos: torch.Tensor, k_val: torch.Tensor, v_val: torch.Tensor):
+        """Update KV cache with the new k_val, v_val and return the updated cache.
+
+        Args:
+            input_pos (Tensor): Current position tensor with shape [S]
+            k_val (Tensor): Current key tensor with shape [B, H, S, D]
+            v_val (Tensor): Current value tensor with shape [B, H, S, D]
+
+        Raises:
+            ValueError: if ``input_pos`` is longer than the maximum sequence length
+
+        Returns:
+            Tuple[Tensor, Tensor]: Updated KV cache with key first
+        """
+        assert input_pos.shape[0] == k_val.shape[2]
+
+        k_out = self.k_cache
+        v_out = self.v_cache
+        k_out[:, :, input_pos] = k_val
+        v_out[:, :, input_pos] = v_val
+
+        return k_out, v_out
 
 class CasualSelfAttention(nn.Module):
     def __init__(self, config):
@@ -170,7 +232,7 @@ class CasualSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, use_cache=False, cache=None):
         # Input shape: (B, T, C)
         B, T, C = x.size()
 
@@ -214,15 +276,15 @@ class MLP(nn.Module):
     def __init__(self, config: GPTConfig):
         super().__init__()
         # Layers
-        self.c_gate_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.c_down_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
-        self.c_up_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.gate_c_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
+        self.down_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
+        self.up_c_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.silu = nn.SiLU()
         self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
         # Feedforward pass
-        return self.dropout(self.c_down_proj(self.silu(self.c_up_proj(x)) * self.c_gate_proj(x)))
+        return self.dropout(self.down_c_proj(self.silu(self.up_c_proj(x)) * self.gate_c_proj(x)))
 
 class Block(nn.Module):
     def __init__(self, config):
@@ -246,7 +308,6 @@ class GPT(nn.Module):
         assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
         # Initialize the model
-        print("Creating Model...")
         self.transformer = nn.ModuleDict(
             dict(
                 wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),             # Token embedding
@@ -260,9 +321,8 @@ class GPT(nn.Module):
         # I don't get how their weights is the same between nn.Embedding and nn.Linear, but the abstract idea.
         # You use the same projection input -> embedding and embedding -> output.
         # Meaning same embedding weights for both to keep it consistent. f(x) & f^-1(x)
-        self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=self.config.bias)
+        self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight
-        self.c_proj = nn.Linear(4 * self.config.n_embd, self.config.n_embd, bias=self.config.bias)
 
         # init all weights
         self.apply(self._init_weights)
@@ -279,7 +339,21 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, x, targets=None):
+    def get_num_params(self):
+        return sum(p.numel() for p in self.parameters()) - self.transformer.wpe.weight.numel()
+
+    def configure_optimizers(self, weight_decay, learning_rate):
+        param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
+        decay_params = [p for n, p in param_dict.items() if p.dim() >= 2]
+        nodecay_params = [p for n, p in param_dict.items() if p.dim() < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+
+        return torch.optim.RAdam(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+
+    def forward(self, x, targets=None, use_cache=False):
         # Batch size and sequence length
         B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
@@ -323,7 +397,7 @@ class GPT(nn.Module):
         # Generation loop
         for _ in range(max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            logits, _ = self(output[:, max(0, T - self.config.block_size):T])
+            logits, _ = self(output[:, max(0, T - self.config.block_size):T], targets=None, use_cache=True)
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution
