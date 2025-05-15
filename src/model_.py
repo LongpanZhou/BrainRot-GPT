@@ -16,7 +16,6 @@ class GPTConfig:
     bias: bool = True               # Whether to use bias
     GQA: bool = True                # Whether to use GQA (Grouped Query Attention)
     GQA_factor = 4                  # The factor for GQA
-    ROPE: bool = True               # Whether to use ROPE (Rotary Positional Embedding)
 
 
 # Code stolen from https://github.com/pytorch/torchtune/blob/main/torchtune/modules/position_embeddings.py
@@ -194,7 +193,7 @@ class KVCache(nn.Module):
         return k_out, v_out
 
 class CasualSelfAttention(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, ROPE):
         super().__init__()
 
         # Variables
@@ -205,7 +204,7 @@ class CasualSelfAttention(nn.Module):
         self.dropout = config.dropout
         self.GQA = config.GQA
         self.GQA_factor = config.GQA_factor
-        self.ROPE = config.ROPE
+        self.ROPE = ROPE
 
         # Linear Projections
         if self.GQA:
@@ -218,9 +217,6 @@ class CasualSelfAttention(nn.Module):
             self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=self.bias)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
 
-        # Rotary Positional Embeddings
-        if self.ROPE: self.rope = RotaryPositionalEmbeddings(dim=self.h_dim,max_seq_len=config.block_size,base=10000)
-
         # Regularization
         self.attn_dropout = nn.Dropout(self.dropout)
         self.resid_dropout = nn.Dropout(self.dropout)
@@ -232,7 +228,7 @@ class CasualSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, use_cache=False, cache=None):
+    def forward(self, x):
         # Input shape: (B, T, C)
         B, T, C = x.size()
 
@@ -247,10 +243,8 @@ class CasualSelfAttention(nn.Module):
             k = k.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
             v = v.view(B, T, self.n_head, self.h_dim ).transpose(1, 2) #( B, n_head, T, h_dim)
 
-        # ROPE
-        if self.ROPE:
-            q = self.rope(q)
-            k = self.rope(k)
+        q = self.ROPE(q)
+        k = self.ROPE(k)
 
         # Flash attention
         if self.flash:
@@ -287,11 +281,11 @@ class MLP(nn.Module):
         return self.dropout(self.down_c_proj(self.silu(self.up_c_proj(x)) * self.gate_c_proj(x)))
 
 class Block(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, ROPE):
         super().__init__()
         # Layers
         self.attn_norm = nn.RMSNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config)
+        self.attn = CasualSelfAttention(config, ROPE)
         self.mlp_norm = nn.RMSNorm(config.n_embd)
         self.mlp = MLP(config)
 
@@ -307,14 +301,16 @@ class GPT(nn.Module):
         self.config = config
         assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
+        # Rotary Positional Embeddings
+        self.ROPE = RotaryPositionalEmbeddings(self.config.n_embd//self.config.n_head, config.block_size)
+
         # Initialize the model
         self.transformer = nn.ModuleDict(
             dict(
-                wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),             # Token embedding
-                wpe = nn.Embedding(self.config.block_size, self.config.n_embd),             # Positional encoding
-                drop = nn.Dropout(self.config.dropout),                                     # Dropout
-                h = nn.ModuleList([Block(config) for _ in range(self.config.n_layers)]),    # Transformer blocks
-                ln_f = nn.RMSNorm(self.config.n_embd)                                       # Final normalization
+                wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),                                 # Token embedding
+                drop = nn.Dropout(self.config.dropout),                                                         # Dropout
+                h = nn.ModuleList([Block(self.config, self.ROPE) for _ in range(self.config.n_layers)]),        # Transformer blocks
+                ln_f = nn.RMSNorm(self.config.n_embd)                                                           # Final normalization
             )
         )
 
@@ -340,7 +336,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_num_params(self):
-        return sum(p.numel() for p in self.parameters()) - self.transformer.wpe.weight.numel()
+        return sum(p.numel() for p in self.parameters()) - self.transformer.wte.weight.numel()
 
     def configure_optimizers(self, weight_decay, learning_rate):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}
@@ -351,20 +347,18 @@ class GPT(nn.Module):
             {'params': nodecay_params, 'weight_decay': 0.0}
         ]
 
-        return torch.optim.RAdam(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
+        return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
 
-    def forward(self, x, targets=None, use_cache=False):
+    def forward(self, x, targets=None):
         # Batch size and sequence length
         B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
 
-        # Token Embedding and positional encoding
-        pos = torch.arange(0, T, dtype=torch.long, device=x.device)
+        # Token Embedding
         tok_emb = self.transformer.wte(x) # (B, T, C)
-        pos_emb = self.transformer.wpe(pos) # (1, T, C)
 
         # Add token and positional embeddings with dropouts
-        x = self.transformer.drop(tok_emb + pos_emb)
+        x = self.transformer.drop(tok_emb)
 
         # Transformer blocks
         for block in self.transformer.h:
@@ -397,7 +391,7 @@ class GPT(nn.Module):
         # Generation loop
         for _ in range(max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            logits, _ = self(output[:, max(0, T - self.config.block_size):T], targets=None, use_cache=True)
+            logits, _ = self(output[:, max(0, T - self.config.block_size):T], targets=None)
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution

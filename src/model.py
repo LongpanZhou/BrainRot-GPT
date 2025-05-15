@@ -104,11 +104,11 @@ class GPT(nn.Module):
         # Initialize the model
         self.transformer = nn.ModuleDict(
             dict(
-                wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),             # Token embedding
-                wpe = nn.Embedding(self.config.block_size, self.config.n_embd),             # Positional encoding
-                drop = nn.Dropout(self.config.dropout),                                     # Dropout
-                h = nn.ModuleList([Block(config) for _ in range(self.config.n_layers)]),    # Transformer blocks
-                ln_f = nn.LayerNorm(self.config.n_embd, bias=self.config.bias)              # Final normalization
+                wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),                     # Token embedding
+                wpe = nn.Embedding(self.config.block_size, self.config.n_embd),                     # Positional encoding
+                drop = nn.Dropout(self.config.dropout),                                             # Dropout
+                h = nn.ModuleList([Block(self.config) for _ in range(self.config.n_layers)]),       # Transformer blocks
+                ln_f = nn.LayerNorm(self.config.n_embd, bias=self.config.bias)                      # Final normalization
             )
         )
 
@@ -134,7 +134,7 @@ class GPT(nn.Module):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def get_num_params(self):
-        return sum(p.numel() for p in self.parameters()) - self.transformer.wpe.weight.numel()
+        return sum(p.numel() for p in self.parameters()) - self.transformer.wte.weight.numel()
 
     def configure_optimizers(self, weight_decay, learning_rate):
         param_dict = {pn: p for pn, p in self.named_parameters() if p.requires_grad}

@@ -56,13 +56,22 @@ This version focuses on improvements over the standard model.
 
 - [x] Positional Embedding - ROPE  `[P-, L++]` <br/> ROPE Embedding allows more accurate positional embedding
 
-- [x] Optimizer - RAdam `[P-, L+++]` <br/> RAdam is a better version of Adam, it is more stable.
-
 - [x] MLP - SwiGLU  `[P-, L+]` <br/> Smoother GELU activation, not sure why it is better
 
-- [ ] Forward - K,V Caching  `[P+]` <br/> K, V caching avoid redundant computation, but takes more memory space
+- [ ] Generate `[P+, L+]` - K, V caching for faster generation, saving computing power but requires more memory
 
-- [ ] MOE `[P++,L++]` <- I have no idea how to do this yet
+### Deepseek Model
+The **Deepseek implementation** can be found in `model_deepseek.py`.
+This version focuses on all the techniques that are used in Deepseek's GPT model.
+*Future progress*
+
+- [ ] Casual Attention - MLA (Multi Layer Attention) `[P++, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
+
+- [ ] MOE - Mixture of Experts `[P++, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
+
+- [ ] Bfloat16 - Bfloat16 `[P+, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
+
+- [ ] Lion Optimizer - Lion Optimizer `[P+]` <br/> This is a new technique that allows the model to learn better attention mechanism
 
 ### CUDA Optimizations
 **Note**: Some of these optimizations might be automatically turned on, or might overlap with each other.

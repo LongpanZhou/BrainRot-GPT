@@ -94,14 +94,13 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
         model = GPT(GPTConfig(
             # block_size = SEQUENCE_LENGTH,     # sequence length
             vocab_size = 100588,    # using cl100k_base tokenizer (scaled to 100288)
-            # n_layers = 36,        # depth
-            # n_embd = 1280,        # embedding size
-            # n_head = 20,          # attention heads
+            # n_layers = 24,        # depth
+            # n_embd = 1024,        # embedding size
+            # n_head = 16,          # attention heads
             dropout = 0.1,          # dropout rate
             # bias = True,          # bias
             # GQA = True,           # GQA (Grouped Query Attention)
             # GQA_factor = 4,       # GQA factor
-            # ROPE = True,          # ROPE (Rotary Positional Embedding)
         )).to(device=local_device)
 
         # Setup logging
@@ -218,7 +217,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
 
 if __name__ == "__main__":
     # Set this to False for single GPU training, True for DDP
-    ddp = torch.cuda.device_count() > 1 and True # True or False
+    ddp = torch.cuda.device_count() > 1 and False # True or False
 
     # Create directories
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -231,7 +230,7 @@ if __name__ == "__main__":
     start = time.time()
     # Main function
     if ddp:
-        GPU_IDS = [1, 2, 3]  # Set your GPU IDs here
+        GPU_IDS = [0, 1, 2, 3]  # Set your GPU IDs here
         world_size = len(GPU_IDS)
 
         # Check if the requested GPUs are available

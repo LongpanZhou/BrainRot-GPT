@@ -13,7 +13,7 @@ from torch.optim.lr_scheduler import OneCycleLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataloader import FineWeb
-from model import GPT, GPTConfig
+from old_model import GPT, GPTConfig
 
 # Device configuration
 if torch.cuda.is_available():
@@ -24,7 +24,7 @@ else:
     device = "cpu"
 
 # Hyperparameters
-BATCH_SIZE = 32                             # Batch size
+BATCH_SIZE = 48                             # Batch size
 SEQUENCE_LENGTH = 1024                      # Sequence length
 STEPS = 30000                               # Total training steps
 LEARNING_RATE = 1e-3                        # Learning rate
@@ -221,7 +221,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
 
 if __name__ == "__main__":
     # Set this to False for single GPU training, True for DDP
-    ddp = torch.cuda.device_count() > 1 and True # True or False
+    ddp = torch.cuda.device_count() > 1 and False # True or False
 
     # Create directories
     os.makedirs(SAVE_DIR, exist_ok=True)
