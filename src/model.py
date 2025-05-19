@@ -49,11 +49,11 @@ class CasualSelfAttention(nn.Module):
         q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
         k = k.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
-        v = v.view(B, T, self.n_head, self.h_dim ).transpose(1, 2) #( B, n_head, T, h_dim)
+        v = v.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
 
         # Flash attention
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         # Regular attention
         else:
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -187,7 +187,7 @@ class GPT(nn.Module):
         output[:, :T] = x
 
         # Generation loop
-        for _ in range(max_new_tokens):
+        for i in range(T,T+max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
             logits, _ = self(output[:, max(0, T - self.config.block_size):T])
             logits = logits[:, -1, :] / temperature
@@ -197,12 +197,11 @@ class GPT(nn.Module):
             x_next = torch.multinomial(probs, num_samples=1)
 
             # Append the sampled token to the output
-            output[:, T] = x_next[:, 0]
-            T+=1
+            output[:, i] = x_next[:, 0]
 
             # Check for end token
-            if end_token == x_next:
+            if end_token >= x_next:
                 break
 
-        # Update the output tensor up to last token
-        return output[:, :T]
+        # Return the generated sequence
+        return output[:, :i+1]

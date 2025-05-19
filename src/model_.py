@@ -14,123 +14,9 @@ class GPTConfig:
     n_head: int = 12                # The number of attention heads
     dropout: float = 0.0            # The dropout probability
     bias: bool = True               # Whether to use bias
-    GQA: bool = True                # Whether to use GQA (Grouped Query Attention)
-    GQA_factor = 4                  # The factor for GQA
+    GQA_factor = 1                  # Factor of GQA
 
-
-# Code stolen from https://github.com/pytorch/torchtune/blob/main/torchtune/modules/position_embeddings.py
-class RotaryPositionalEmbeddings(nn.Module):
-    """
-    This class implements Rotary Positional Embeddings (RoPE)
-    proposed in https://arxiv.org/abs/2104.09864.
-
-    Reference implementation (used for correctness verification)
-    can be found here:
-    https://github.com/meta-llama/llama/blob/main/llama/model.py#L80
-
-    In this implementation we cache the embeddings for each position upto
-    ``max_seq_len`` by computing this during init.
-
-    Args:
-        dim (int): Embedding dimension. This is usually set to the dim of each
-            head in the attention module computed as ``embed_dim // num_heads``
-        max_seq_len (int): Maximum expected sequence length for the
-            model, if exceeded the cached freqs will be recomputed
-        base (int): The base for the geometric progression used to compute
-            the rotation angles
-    """
-
-    def __init__(
-            self,
-            dim: int,
-            max_seq_len: int = 4096,
-            base: int = 10_000,
-    ) -> None:
-        super().__init__()
-        self.dim = dim
-        self.base = base
-        self.max_seq_len = max_seq_len
-        self.rope_init()
-
-    def rope_init(self):
-        theta = 1.0 / (
-                self.base
-                ** (torch.arange(0, self.dim, 2)[: (self.dim // 2)].float() / self.dim)
-        )
-        self.register_buffer("theta", theta, persistent=False)
-        self.build_rope_cache(self.max_seq_len)
-
-    def build_rope_cache(self, max_seq_len: int = 4096) -> None:
-        # Create position indexes `[0, 1, ..., max_seq_len - 1]`
-        seq_idx = torch.arange(
-            max_seq_len, dtype=self.theta.dtype, device=self.theta.device
-        )
-
-        # Outer product of theta and position index; output tensor has
-        # a shape of [max_seq_len, dim // 2]
-        idx_theta = torch.einsum("i, j -> ij", seq_idx, self.theta).float()
-
-        # cache includes both the cos and sin components and so the output shape is
-        # [max_seq_len, dim // 2, 2]
-        cache = torch.stack([torch.cos(idx_theta), torch.sin(idx_theta)], dim=-1)
-        self.register_buffer("cache", cache, persistent=False)
-
-    def forward(
-            self, x: torch.Tensor, *, input_pos: torch.Tensor = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            x (torch.Tensor): input tensor with shape
-                ``[b, s, n_h, h_d]``
-            input_pos (Optional[torch.Tensor]): Optional tensor which contains the position ids
-                of each token. During training, this is used to indicate the positions
-                of each token relative to its sample when packed, shape [b, s].
-                During inference, this indicates the position of the current token.
-                If none, assume the index of the token is its position id. Default is None.
-
-        Returns:
-            torch.Tensor: output tensor with shape ``[b, s, n_h, h_d]``
-
-        Notation used for tensor shapes:
-            - b: batch size
-            - s: sequence length
-            - n_h: num heads
-            - h_d: head dim
-        """
-        # input tensor has shape [b, s, n_h, h_d]
-        seq_len = x.size(1)
-
-        # extract the values based on whether input_pos is set or not
-        rope_cache = (
-            self.cache[:seq_len] if input_pos is None else self.cache[input_pos]
-        )
-
-        # reshape input; the last dimension is used for computing the output.
-        # Cast to float to match the reference implementation
-        # tensor has shape [b, s, n_h, h_d // 2, 2]
-        xshaped = x.float().reshape(*x.shape[:-1], -1, 2)
-
-        # reshape the cache for broadcasting
-        # tensor has shape [b, s, 1, h_d // 2, 2] if packed samples,
-        # otherwise has shape [1, s, 1, h_d // 2, 2]
-        rope_cache = rope_cache.view(-1, xshaped.size(1), 1, xshaped.size(3), 2)
-
-        # tensor has shape [b, s, n_h, h_d // 2, 2]
-        x_out = torch.stack(
-            [
-                xshaped[..., 0] * rope_cache[..., 0]
-                - xshaped[..., 1] * rope_cache[..., 1],
-                xshaped[..., 1] * rope_cache[..., 0]
-                + xshaped[..., 0] * rope_cache[..., 1],
-                ],
-            -1,
-        )
-
-        # tensor has shape [b, s, n_h, h_d]
-        x_out = x_out.flatten(3)
-        return x_out.type_as(x)
-
-#Code stolen from https://github.com/pytorch/torchtune/blob/main/torchtune/modules/kv_cache.py
+# Code stolen from: https://docs.pytorch.org/torchtune/stable/_modules/torchtune/modules/kv_cache.html#KVCache
 class KVCache(nn.Module):
     """
     Standalone ``nn.Module`` containing a kv-cache to cache past key and values during inference.
@@ -138,9 +24,7 @@ class KVCache(nn.Module):
     Args:
         batch_size (int): batch size model will be run with
         max_seq_len (int): maximum sequence length model will be run with
-        num_heads (int): number of heads. We take num_heads instead of num_kv_heads because
-            the cache is created after we've expanded the key and value tensors to have the
-            same shape as the query tensor. See attention.py for more details
+        num_kv_heads (int): number of key/value heads.
         head_dim (int): per-attention head embedding dimension
         dtype (torch.dtype): dtype for the caches
     """
@@ -149,17 +33,20 @@ class KVCache(nn.Module):
             self,
             batch_size: int,
             max_seq_len: int,
-            num_heads: int,
+            num_kv_heads: int,
             head_dim: int,
             dtype: torch.dtype,
     ) -> None:
         super().__init__()
-        cache_shape = (batch_size, num_heads, max_seq_len, head_dim)
+        cache_shape = (batch_size, num_kv_heads, max_seq_len, head_dim)
         self.register_buffer(
             "k_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
         )
         self.register_buffer(
             "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
+        )
+        self.register_buffer(
+            "cache_pos", torch.arange(0, cache_shape[2]), persistent=False
         )
         self.batch_size = batch_size
 
@@ -167,59 +54,82 @@ class KVCache(nn.Module):
         """Reset the cache to zero."""
         self.k_cache.zero_()
         self.v_cache.zero_()
+        self.cache_pos -= self.size
 
+    @property
+    def size(self) -> int:
+        return self.cache_pos[0].item()
 
-    def update(self, input_pos: torch.Tensor, k_val: torch.Tensor, v_val: torch.Tensor):
-        """Update KV cache with the new k_val, v_val and return the updated cache.
+    def update(self, k_val: torch.Tensor, v_val: torch.Tensor):
+        """Update KV cache with the new ``k_val``, ``v_val`` and return the updated cache.
+
+        Note:
+            When updating the KV cache, it is assumed that subsequent updates should update key-value
+            positions in consecutive sequence positions. If you wish to update cache values which have
+            already been filled, use ``.reset()``, which will reset the cache to the zero-th position.
 
         Args:
-            input_pos (Tensor): Current position tensor with shape [S]
-            k_val (Tensor): Current key tensor with shape [B, H, S, D]
-            v_val (Tensor): Current value tensor with shape [B, H, S, D]
-
-        Raises:
-            ValueError: if ``input_pos`` is longer than the maximum sequence length
+            k_val (torch.Tensor): Current key tensor with shape [B, H, S, D]
+            v_val (torch.Tensor): Current value tensor with shape [B, H, S, D]
 
         Returns:
-            Tuple[Tensor, Tensor]: Updated KV cache with key first
-        """
-        assert input_pos.shape[0] == k_val.shape[2]
+            Tuple[torch.Tensor, torch.Tensor]: Updated key and value cache tensors, respectively.
 
+        Raises:
+            ValueError: if the batch size of the new key (or value) tensor is greater than the batch size
+                used during cache setup.
+
+        Note:
+            This function will raise an ``AssertionError`` if the sequence length of ``k_val``
+                is longer than the maximum cache sequence length.
+
+        """
+        bsz, _, seq_len, _ = k_val.shape
+        if bsz > self.k_cache.shape[0]:
+            raise ValueError(
+                f"The current cache has been setup with a batch size of {self.k_cache.shape[0]}"
+                f", but found new key tensors with batch size {k_val.shape[0]}!"
+            )
+
+        assert (self.cache_pos[0] + seq_len) <= self.k_cache.shape[2]
         k_out = self.k_cache
         v_out = self.v_cache
-        k_out[:, :, input_pos] = k_val
-        v_out[:, :, input_pos] = v_val
+
+        k_out[:, :, self.cache_pos[:seq_len]] = k_val
+        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+
+        self.cache_pos.add_(seq_len)
 
         return k_out, v_out
 
 class CasualSelfAttention(nn.Module):
-    def __init__(self, config, ROPE):
+    def __init__(self, config):
         super().__init__()
 
         # Variables
+        self.block_size = config.block_size
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.h_dim = config.n_embd // config.n_head
+        self.kv_head = config.n_head // config.GQA_factor
         self.bias = config.bias
         self.dropout = config.dropout
-        self.GQA = config.GQA
         self.GQA_factor = config.GQA_factor
-        self.ROPE = ROPE
+
+        # Key/Value cache
+        self.KV_cache = KVCache(1, self.block_size, self.kv_head, self.h_dim, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
 
         # Linear Projections
-        if self.GQA:
-            assert self.n_embd % self.GQA_factor == 0, "Embedding dimension must be divisible by GQA factor"
-            KV_dim = self.n_embd // self.GQA_factor
-            self.c_attn_q = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
-            self.c_attn_k = nn.Linear(self.n_embd, KV_dim, bias=self.bias)
-            self.c_attn_v = nn.Linear(self.n_embd, KV_dim, bias=self.bias)
-        else:
-            self.c_attn = nn.Linear(self.n_embd, 3 * self.n_embd, bias=self.bias)
+        assert self.n_embd % self.GQA_factor == 0, "Embedding dimension must be divisible by GQA factor"
+
+        self.c_attn_q = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
+        self.c_attn_k = nn.Linear(self.n_embd, self.n_embd//self.GQA_factor, bias=self.bias)
+        self.c_attn_v = nn.Linear(self.n_embd, self.n_embd//self.GQA_factor, bias=self.bias)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=self.bias)
 
         # Regularization
-        self.attn_dropout = nn.Dropout(self.dropout)
-        self.resid_dropout = nn.Dropout(self.dropout)
+        self.attn_dropout = nn.Dropout(self.dropout, inplace=True)
+        self.resid_dropout = nn.Dropout(self.dropout, inplace=True)
 
         # Flash attention
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention') and torch.cuda.is_available()
@@ -228,33 +138,29 @@ class CasualSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, cache_enable):
         # Input shape: (B, T, C)
         B, T, C = x.size()
 
         # Set Q, K, V
-        if self.GQA:
-            q = self.c_attn_q(x).view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
-            k = self.c_attn_k(x).view(B, T, self.n_head // self.GQA_factor, self.h_dim).transpose(1, 2) #( B, n_head//GQA_factor, T, h_dim)
-            v = self.c_attn_v(x).view(B, T, self.n_head // self.GQA_factor, self.h_dim).transpose(1, 2) #( B, n_head//GQA_factor, T, h_dim)
-        else:
-            q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
-            q = q.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
-            k = k.view(B, T, self.n_head, self.h_dim).transpose(1, 2) #( B, n_head, T, h_dim)
-            v = v.view(B, T, self.n_head, self.h_dim ).transpose(1, 2) #( B, n_head, T, h_dim)
+        q = self.c_attn_q(x).view(B, T, self.n_head, self.h_dim).transpose(1, 2)    #(B, n_head, T, h_dim)
+        k = self.c_attn_k(x).view(B, T, self.kv_head, self.h_dim).transpose(1, 2)   #(B, n_head//GQA_factor, T, h_dim)
+        v = self.c_attn_v(x).view(B, T, self.kv_head, self.h_dim).transpose(1, 2)   #(B, n_head//GQA_factor, T, h_dim)
 
-        q = self.ROPE(q)
-        k = self.ROPE(k)
+        # Cache enable
+        if cache_enable:
+            k, v = self.KV_cache.update(k, v)
+
+        # Repeat K and V for GQA
+        if self.GQA_factor > 1:
+            k = k.repeat_interleave(self.GQA_factor, dim=1)
+            v = v.repeat_interleave(self.GQA_factor, dim=1)
 
         # Flash attention
         if self.flash:
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, enable_gqa=self.GQA)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         # Regular attention
         else:
-            if self.GQA:
-                k = k.repeat_interleave(q.size(-3)//k.size(-3), -3)
-                v = v.repeat_interleave(q.size(-3)//v.size(-3), -3)
-
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
@@ -273,27 +179,31 @@ class MLP(nn.Module):
         self.gate_c_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
         self.down_c_proj = nn.Linear(4 * config.n_embd, config.n_embd, bias=config.bias)
         self.up_c_proj = nn.Linear(config.n_embd, 4 * config.n_embd, bias=config.bias)
-        self.silu = nn.SiLU()
-        self.dropout = nn.Dropout(config.dropout)
+        self.silu = nn.SiLU(inplace=True)
+        self.dropout = nn.Dropout(config.dropout, inplace=True)
 
     def forward(self, x):
         # Feedforward pass
         return self.dropout(self.down_c_proj(self.silu(self.up_c_proj(x)) * self.gate_c_proj(x)))
 
 class Block(nn.Module):
-    def __init__(self, config, ROPE):
+    def __init__(self, config):
         super().__init__()
         # Layers
-        self.attn_norm = nn.RMSNorm(config.n_embd)
-        self.attn = CasualSelfAttention(config, ROPE)
-        self.mlp_norm = nn.RMSNorm(config.n_embd)
+        # self.attn_norm = nn.RMSNorm(config.n_embd)
+        self.attn = CasualSelfAttention(config)
+        # self.mlp_norm = nn.RMSNorm(config.n_embd)
         self.mlp = MLP(config)
+        self.n_embd = config.n_embd
 
-    def forward(self, x):
+    def forward(self, x, cache_enable):
         # Residual connection
-        x = x + self.attn(self.attn_norm(x))
-        x = x + self.mlp(self.mlp_norm(x))
+        x = x + self.attn(F.rms_norm(x, normalized_shape=[self.n_embd]), cache_enable=cache_enable)
+        x = x + self.mlp(F.rms_norm(x, normalized_shape=[self.n_embd]))
         return x
+
+    def clear_cache(self):
+        self.attn.KV_cache.reset()
 
 class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
@@ -301,16 +211,13 @@ class GPT(nn.Module):
         self.config = config
         assert self.config.n_embd % self.config.n_head == 0, "Embedding dimension must be divisible by number of heads"
 
-        # Rotary Positional Embeddings
-        self.ROPE = RotaryPositionalEmbeddings(self.config.n_embd//self.config.n_head, config.block_size)
-
         # Initialize the model
         self.transformer = nn.ModuleDict(
             dict(
                 wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),                                 # Token embedding
-                drop = nn.Dropout(self.config.dropout),                                                         # Dropout
-                h = nn.ModuleList([Block(self.config, self.ROPE) for _ in range(self.config.n_layers)]),        # Transformer blocks
-                ln_f = nn.RMSNorm(self.config.n_embd)                                                           # Final normalization
+                drop = nn.Dropout(self.config.dropout, inplace=True),                                           # Dropout
+                h = nn.ModuleList([Block(self.config) for _ in range(self.config.n_layers)]),        # Transformer blocks
+                # ln_f = nn.RMSNorm(self.config.n_embd)                                                         # Final normalization
             )
         )
 
@@ -349,7 +256,11 @@ class GPT(nn.Module):
 
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
 
-    def forward(self, x, targets=None):
+    def clear_cache(self):
+        for block in self.transformer.h:
+            block.clear_cache()
+
+    def forward(self, x, targets=None, cache_enable=False):
         # Batch size and sequence length
         B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
@@ -362,10 +273,10 @@ class GPT(nn.Module):
 
         # Transformer blocks
         for block in self.transformer.h:
-            x = block(x)
+            x = block(x, cache_enable=cache_enable)
 
         # Final normalization
-        x = self.transformer.ln_f(x)
+        x = F.rms_norm(x, normalized_shape=[self.config.n_embd])
 
         # Logits and Loss
         if targets is not None:
@@ -380,18 +291,28 @@ class GPT(nn.Module):
         return logits, loss
 
     @torch.no_grad()
-    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None):
+    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None, cache_enable=False):
         # Batch size and sequence length
         B, T = x.size()
+        assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
 
         # Preallocate output tensor -> Optimization
         output = torch.zeros(B, T+max_new_tokens, dtype=x.dtype, device=x.device)
         output[:, :T] = x
 
         # Generation loop
-        for _ in range(max_new_tokens):
+        for i in range(T,T+max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            logits, _ = self(output[:, max(0, T - self.config.block_size):T], targets=None)
+            if cache_enable:
+                logits, _ = self(x, targets=None, cache_enable=cache_enable)
+
+            logits2, _ = self(output[:, max(0, i - self.config.block_size):i])
+            print(logits.shape,logits2.shape)
+
+            for a, b in zip(logits, logits2):
+                print(a, b)
+
+            # Temperature scaling
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution
@@ -399,12 +320,13 @@ class GPT(nn.Module):
             x_next = torch.multinomial(probs, num_samples=1)
 
             # Append the sampled token to the output
-            output[:, T] = x_next[:, 0]
-            T+=1
+            x = output[:, i] = x_next[:, 0]
+            x = x.unsqueeze(0)
 
             # Check for end token
-            if end_token == x_next:
+            if x_next >= end_token:
                 break
 
-        # Update the output tensor up to last token
-        return output[:, :T]
+        # Return the generated sequence
+        self.clear_cache()
+        return output[:, :i+1]

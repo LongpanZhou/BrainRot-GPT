@@ -9,6 +9,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from datetime import datetime
+from sms.sms import sms_client
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 
@@ -24,15 +25,17 @@ else:
     device = "cpu"
 
 # Hyperparameters
-BATCH_SIZE = 32                             # Batch size
+BATCH_SIZE = 48                             # Batch size
 SEQUENCE_LENGTH = 1024                      # Sequence length
 STEPS = 30000                               # Total training steps
-LEARNING_RATE = 1e-3                        # Learning rate
+LEARNING_RATE = 1.2e-3                        # Learning rate
 EVAL_EVERY_STEPS = 100                      # Evaluate every N steps
 EVAL_ITERS = 25                             # Number of evaluation iterations
 SAVE_EVERY_STEPS = STEPS//10                # Save every N steps
 SAVE_DIR = "./checkpoints"                  # Directory to save checkpoints
+SAVE = False                                # Save Model Toggle
 LOG_DIR = "./logs"                          # Directory to save logs
+TIME_TO_FETCH = 5                           # Time to fetch commands (in mins)
 CUDA_ENABLED = (device == "cuda")           # Use CUDA
 
 # Tokenizer
@@ -67,6 +70,7 @@ def setup_logging(ddp, model, GPU_IDs):
     logging.info(f"EVAL_EVERY_STEPS   = {EVAL_EVERY_STEPS}")
     logging.info(f"EVAL_ITERS         = {EVAL_ITERS}")
     logging.info(f"SAVE_EVERY_STEPS   = {SAVE_EVERY_STEPS}")
+    logging.info(f"SAVE               = {SAVE}")
     logging.info(f"SAVE_DIR           = {SAVE_DIR}")
     logging.info(f"LOG_DIR            = {LOG_DIR}")
     logging.info(f"CUDA_ENABLED       = {CUDA_ENABLED}")
@@ -88,7 +92,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
         # Set device
         local_device = torch.device(f"cuda:{GPU_ID}")
         is_master = (world_size == 1) or (rank == 0)
-        amp_enable = torch.cuda.is_bf16_supported() and CUDA_ENABLED
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
         # Model
         model = GPT(GPTConfig(
@@ -99,9 +103,8 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
             # n_head = 16,          # attention heads
             dropout = 0.1,          # dropout rate
             # bias = True,          # bias
-            # GQA = True,           # GQA (Grouped Query Attention)
-            # GQA_factor = 4,       # GQA factor
-        )).to(device=local_device)
+            # GQA_factor = 4,       # GQA factor (Set to 1 for no GQA)
+        )).to(device=local_device, dtype=dtype)
 
         # Setup logging
         if is_master: setup_logging(ddp,model,GPU_IDs)
@@ -125,6 +128,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
         val_idx = np.random.randint(0, len(val_dataset), size=STEPS*EVAL_ITERS) if is_master else None
         v_idx = 0
 
+        last_checked = start = time.time()
         # Training Loop
         for step in range(STEPS):
             # Get random batch (each process gets different batch)
@@ -132,8 +136,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
             x, y = x.to(local_device, non_blocking=True), y.to(local_device, non_blocking=True)
 
             # Forward pass
-            with torch.autocast(device_type="cuda", enabled=amp_enable, dtype=torch.bfloat16):
-                _, loss = model(x, y)
+            _, loss = model(x, y)
 
             # Backward pass
             loss.backward()
@@ -156,8 +159,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                         for t in range(EVAL_ITERS):
                             x, y = val_dataset[val_idx[v_idx]]
                             x, y = x.to(local_device, non_blocking=True), y.to(local_device, non_blocking=True)
-                            with torch.autocast(device_type="cuda", enabled=amp_enable, dtype=torch.bfloat16):
-                                _, loss_ = model(x, y)
+                            _, loss_ = model(x, y)
                             val_loss += loss_.item()
                             v_idx += 1
 
@@ -177,9 +179,10 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                         tokens = enc.encode(text)
                         out = raw_model.generate(
                             torch.tensor([tokens]).to(local_device),
-                            max_new_tokens=SEQUENCE_LENGTH,
+                            max_new_tokens=SEQUENCE_LENGTH-len(tokens)-1,
                             temperature=1.0,
                             end_token=enc.eot_token,
+                            cache_enable=True          #False if training in ddp, or do not call with True whee
                         )
                     model.train()
                     # end = time.time()
@@ -187,8 +190,14 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                     try: logging.info(enc.decode(out[0].tolist()))
                     except Exception as e: logging.error(f"Void token: {e}")
 
+                    # Fetch commands
+                    if time.time() - last_checked > TIME_TO_FETCH * 60:
+                        if sms_client.fetch_message_received("Status"):
+                            sms_client.send_message(f"Time:{time.time()-start}s Step: {step}, Val Loss: {avg_val_loss}, Perplexity: {perplexity.item()}")
+                        last_checked = time.time()
+
                 # Save checkpoint
-                if step % SAVE_EVERY_STEPS == 0 and step != 0:
+                if SAVE and step % SAVE_EVERY_STEPS == 0 and step != 0:
                     torch.save({
                         'step': step,
                         'model_state_dict': raw_model.state_dict(),
@@ -197,12 +206,14 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                     }, 'checkpoints/last_ckpt.pth')
 
         # Save final checkpoint
-        torch.save({
-            'step': step,
-            'model_state_dict': raw_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler': scheduler.state_dict()
-        }, 'checkpoints/final_ckpt.pth')
+        if is_master:
+            if SAVE:
+                torch.save({
+                    'step': STEPS,
+                    'model_state_dict': raw_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict()
+                }, 'checkpoints/final_ckpt.pth')
 
     # Handle exceptions
     except Exception as e:
@@ -248,7 +259,7 @@ if __name__ == "__main__":
         )
     else:
         print("Starting single GPU training")
-        main(0, 1, [0], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
+        main(0, 1, [1], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
     end = time.time()
-
     logging.info(f"Total time: {end - start} seconds")
+    sms_client.send_message(f"Training completed in {end-start} seconds.")

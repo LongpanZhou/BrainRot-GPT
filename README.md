@@ -25,6 +25,15 @@
 2. Run `train.py` - This will start the main training loop.
 3. Run `eval.py` - This will load your saved model and generate sample texts.
 
+## Features
+
+- [x] Logging - Automated logging and checkpointing of model weights
+
+- [x] Dynamic DDP - Can be set to which specific GPU to use
+ 
+- [ ] SMS - SMS notification for when training is done
+
+
 ## FineWeb
 The FineWeb dataset consists of more than 15T tokens of cleaned and deduplicated english web data from CommonCrawl. The one being used in the being used in this project is "sample-10BT", which covers 10 billion tokens (in gpt-2 coding) about size 30GB.
 
@@ -58,7 +67,9 @@ This version focuses on improvements over the standard model.
 
 - [x] MLP - SwiGLU  `[P-, L+]` <br/> Smoother GELU activation, not sure why it is better
 
-- [ ] Generate `[P+, L+]` - K, V caching for faster generation, saving computing power but requires more memory
+- [x] Bfloat16 - Bfloat16 `[P+, L*-]` <br/> This allows the model to use bfloat16 instead of float32, which saves a lot of memory and computation
+
+- [x] Generate `[P+, L+]` - K, V caching for faster generation, saving computing power but requires more memory
 
 ### Deepseek Model
 The **Deepseek implementation** can be found in `model_deepseek.py`.
@@ -67,11 +78,9 @@ This version focuses on all the techniques that are used in Deepseek's GPT model
 
 - [ ] Casual Attention - MLA (Multi Layer Attention) `[P++, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
 
-- [ ] MOE - Mixture of Experts `[P++, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
+- [ ] MOE - Mixture of Experts `[P++, L*-]` <br/> Activate only a few experts in each layer, this allows the model to learn better attention mechanism
 
-- [ ] Bfloat16 - Bfloat16 `[P+, L*-]` <br/> This is a new technique that allows the model to learn better attention mechanism
-
-- [ ] Lion Optimizer - Lion Optimizer `[P+]` <br/> This is a new technique that allows the model to learn better attention mechanism
+- [ ] GOPE - 
 
 ### CUDA Optimizations
 **Note**: Some of these optimizations might be automatically turned on, or might overlap with each other.

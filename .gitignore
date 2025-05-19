@@ -4,7 +4,7 @@ src/checkpoints/
 src/logs/
 src/train.bin
 src/test.bin
-src/CONFIG.py
+src/sms/CONFIG.py
 qodana.yaml
 
 # Byte-compiled / optimized / DLL files

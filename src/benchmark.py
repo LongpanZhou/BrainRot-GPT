@@ -15,7 +15,7 @@ STEPS = 20000                               # Total training steps
 LEARNING_RATE = 1e-3                        # Learning rate
 
 # Model
-model = GPT(GPTConfig(vocab_size=100288)).to(device='cuda')
+model = GPT(GPTConfig(vocab_size=100288, bias=False)).to(device='cuda')
 model = torch.compile(model)
 optimizer = model.configure_optimizers(1e-8,1e-3)
 

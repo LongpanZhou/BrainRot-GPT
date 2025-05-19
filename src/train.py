@@ -9,11 +9,12 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from datetime import datetime
+from sms.sms import sms_client
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.nn.parallel import DistributedDataParallel as DDP
 
 from dataloader import FineWeb
-from old_model import GPT, GPTConfig
+from model import GPT, GPTConfig
 
 # Device configuration
 if torch.cuda.is_available():
@@ -34,6 +35,7 @@ SAVE_EVERY_STEPS = STEPS//10                # Save every N steps
 SAVE = False                                # Save Model Toggle
 SAVE_DIR = "./checkpoints"                  # Directory to save checkpoints
 LOG_DIR = "./logs"                          # Directory to save logs
+TIME_TO_FETCH = 5                           # Time to fetch commands (in mins)
 CUDA_ENABLED = (device == "cuda")           # Use CUDA
 
 # Tokenizer
@@ -125,7 +127,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
         val_idx = np.random.randint(0, len(val_dataset), size=STEPS*EVAL_ITERS) if is_master else None
         v_idx = 0
 
-        start = time.time()
+        last_checked = start = time.time()
         # Training Loop
         for step in range(STEPS):
             # Get random batch (each process gets different batch)
@@ -188,6 +190,12 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                     try: logging.info(enc.decode(out[0].tolist()))
                     except Exception as e: logging.error(f"Void token: {e}")
 
+                    # Fetch commands
+                    if time.time() - last_checked > TIME_TO_FETCH * 60:
+                        if sms_client.fetch_message_received("Status"):
+                            sms_client.send_message(f"Time:{time.time()-start}s Step: {step}, Val Loss: {avg_val_loss}, Perplexity: {perplexity.item()}")
+                        last_checked = time.time()
+
                 # Save checkpoint
                 if SAVE and step % SAVE_EVERY_STEPS == 0 and step != 0:
                     torch.save({
@@ -198,16 +206,15 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                     }, 'checkpoints/last_ckpt.pth')
 
         # Save final checkpoint
-        if SAVE:
-            torch.save({
-                'step': STEPS,
-                'model_state_dict': raw_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler': scheduler.state_dict()
-            }, 'checkpoints/final_ckpt.pth')
+        if is_master:
+            if SAVE:
+                torch.save({
+                    'step': STEPS,
+                    'model_state_dict': raw_model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler': scheduler.state_dict()
+                }, 'checkpoints/final_ckpt.pth')
 
-        end = time.time()
-        logging.info(f"Total time: {end-start} seconds")
     # Handle exceptions
     except Exception as e:
         logging.error(f"GPU {GPU_IDs[rank]}: Error occurred: {str(e)}")
@@ -221,7 +228,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
 
 if __name__ == "__main__":
     # Set this to False for single GPU training, True for DDP
-    ddp = torch.cuda.device_count() > 1 and False # True or False
+    ddp = torch.cuda.device_count() > 1 and True # True or False
 
     # Create directories
     os.makedirs(SAVE_DIR, exist_ok=True)
@@ -231,6 +238,7 @@ if __name__ == "__main__":
     train_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="train")
     val_dataset = FineWeb(B=BATCH_SIZE, T=SEQUENCE_LENGTH, split="test")
 
+    start = time.time()
     # Main function
     if ddp:
         GPU_IDS = [0, 1, 2, 3]  # Set your GPU IDs here
@@ -252,3 +260,6 @@ if __name__ == "__main__":
     else:
         print("Starting single GPU training")
         main(0, 1, [0], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
+    end = time.time()
+    logging.info(f"Total time: {end-start} seconds")
+    sms_client.send_message(f"Training completed in {end-start} seconds.")
