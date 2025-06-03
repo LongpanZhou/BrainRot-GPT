@@ -39,7 +39,7 @@ class CasualSelfAttention(nn.Module):
 
         if not self.flash:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                 .view(1, 1, config.block_size, config.block_size))
+                                 .view(1, 1, config.block_size, config.block_size), persistent=True)
 
     def forward(self, x):
         # Input shape: (B, T, C)
@@ -177,7 +177,7 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def generate(self, x, max_new_tokens, temperature=1.0, end_token=None):
         # Batch size and sequence length
         B, T = x.size()
@@ -189,7 +189,7 @@ class GPT(nn.Module):
         # Generation loop
         for i in range(T,T+max_new_tokens):
             # Get the last T tokens, feed them to the model, and get the logits
-            logits, _ = self(output[:, max(0, T - self.config.block_size):T])
+            logits, _ = self(output[:, max(0, i - self.config.block_size):i])
             logits = logits[:, -1, :] / temperature
 
             # Sample from the distribution

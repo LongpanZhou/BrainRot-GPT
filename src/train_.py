@@ -97,7 +97,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
         # Model
         model = GPT(GPTConfig(
             # block_size = SEQUENCE_LENGTH,     # sequence length
-            vocab_size = 100588,    # using cl100k_base tokenizer (scaled to 100288)
+            vocab_size = 100588,    # using cl100k_base tokenizer (scaled to 100588)
             # n_layers = 24,        # depth
             # n_embd = 1024,        # embedding size
             # n_head = 16,          # attention heads
@@ -181,8 +181,7 @@ def main(rank, world_size, GPU_IDs, ddp, train_dataset, val_dataset):
                             torch.tensor([tokens]).to(local_device),
                             max_new_tokens=SEQUENCE_LENGTH-len(tokens)-1,
                             temperature=1.0,
-                            end_token=enc.eot_token,
-                            cache_enable=True          #False if training in ddp, or do not call with True whee
+                            end_token=enc.eot_token
                         )
                     model.train()
                     # end = time.time()
@@ -259,7 +258,7 @@ if __name__ == "__main__":
         )
     else:
         print("Starting single GPU training")
-        main(0, 1, [1], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
+        main(0, 1, [2], ddp=False, train_dataset=train_dataset, val_dataset=val_dataset)
     end = time.time()
     logging.info(f"Total time: {end - start} seconds")
     sms_client.send_message(f"Training completed in {end-start} seconds.")

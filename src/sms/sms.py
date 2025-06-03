@@ -1,10 +1,9 @@
+from sms.CONFIG import *
 from pythontextnow.enum import MessageDirection
-
-from CONFIG import *
 from pythontextnow import Client, ConversationService
 # There might be some bugs wth the package. You need to delete every error in the code... (kw_only, get_random_user_agent etc)
 # Then you need to go to client.py, to set the user agent to the one matching with your TextNow logged in <- You need to fetch the user agent from the browser
-# Textnow will take 3 days for web messaging to be enabled...
+# TextNow will take 3 days for web messaging to be enabled...
 
 # Sending message
 class TextNowSMS:

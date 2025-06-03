@@ -3,20 +3,22 @@
 ![Image](src/imgs/Demo.jpg)
 
 > [!IMPORTANT]
-> *If you like this project, or find this project helpful, please give me a star. Thank you!* <br/><br/>
-> The original training was done on 4 × H100 80GB GPUs. With DDP enabled, it roughly takes about 12 hours to complete training. <br/>
-> You can run the model with less powerful setup, but since this project is not yet done there is no weights released. <br/>
+> **If you like this project, or find this project helpful, please give me a star. Thank you!** <br/><br/>
+> The standard model of 130m parameters(cl_100k) training was done on 4 × H100 80GB GPUs. With DDP enabled, it roughly takes about 4 hours to complete training. <br/>
+> You can run/deploy the model with less powerful setup, but since this project is not yet done there is no weights released. <br/>
 
 > [!NOTE]
 > If you have any questions or suggestions, please feel free to open an issue or pull request. <br/>
-> This project covers useful information about a self implemented GPT model <br/>
+> This project covers useful information about a self implemented GPT models. <br/>
 
 ## Structure
 - `fineweb_dataset.py` — Downloads the FineWeb dataset from HuggingFace, splits it, and encodes it into binary format
 - `dataloader.py` — Implements a Dataset class for loading binary files as torch tensors
+- `sms/*.py` — Contains the SMS notification system for training progress
 - `model.py` — Standard implementation of GPT model
 - `model_.py` (INCOMPLETE) — Optimized implementation of GPT model
-- `train.py` — Handles model training, including optimization and checkpointing
+- `train.py` — Main training script for the standard model
+- `train_.py` (INCOMPLETE) — Main training script for the optimized model
 - `eval.py` (INCOMPLETE) — Loads a trained model and generates sample outputs for evaluation
 
 ## Usage
@@ -31,8 +33,7 @@
 
 - [x] Dynamic DDP - Can be set to which specific GPU to use
  
-- [ ] SMS - SMS notification for when training is done
-
+- [x] SMS - SMS notification - fetch data from sms text
 
 ## FineWeb
 The FineWeb dataset consists of more than 15T tokens of cleaned and deduplicated english web data from CommonCrawl. The one being used in the being used in this project is "sample-10BT", which covers 10 billion tokens (in gpt-2 coding) about size 30GB.
@@ -83,7 +84,7 @@ This version focuses on all the techniques that are used in Deepseek's GPT model
 - [ ] GOPE - 
 
 ### CUDA Optimizations
-**Note**: Some of these optimizations might be automatically turned on, or might overlap with each other.
+**Note**: Some of these optimizations might be automatically turned on, or might overlap with each other. <br/><br/>
 torch.nn.parallel.DistributedDataParallel `[P+++++]`<br/> - Stands for `Distributed Data Parallel`, allows multiple nodes, gpus in each node to work together.<br/><br/>
 torch.backends.cudnn.benchmark `[P*+]` in LLM<br/> - Allows pytorch to auto tune CNN convolution algorithm.<br/><br/>
 torch.backends.cuda.matmul.allow_tf32 `[P++]`<br/> - Allows GPU to enable tf32 format in matmul requires GPU support.<br/><br/>

@@ -45,20 +45,18 @@ class KVCache(nn.Module):
         self.register_buffer(
             "v_cache", torch.zeros(cache_shape, dtype=dtype), persistent=False
         )
-        self.register_buffer(
-            "cache_pos", torch.arange(0, cache_shape[2]), persistent=False
-        )
+        self.cache_pos = 0
         self.batch_size = batch_size
 
     def reset(self) -> None:
         """Reset the cache to zero."""
         self.k_cache.zero_()
         self.v_cache.zero_()
-        self.cache_pos -= self.size
+        self.cache_pos = 0
 
     @property
     def size(self) -> int:
-        return self.cache_pos[0].item()
+        return self.cache_pos
 
     def update(self, k_val: torch.Tensor, v_val: torch.Tensor):
         """Update KV cache with the new ``k_val``, ``v_val`` and return the updated cache.
@@ -90,15 +88,15 @@ class KVCache(nn.Module):
                 f"The current cache has been setup with a batch size of {self.k_cache.shape[0]}"
                 f", but found new key tensors with batch size {k_val.shape[0]}!"
             )
-
-        assert (self.cache_pos[0] + seq_len) <= self.k_cache.shape[2]
+        target_pos = self.cache_pos + seq_len
+        assert (target_pos) <= self.k_cache.shape[2]
         k_out = self.k_cache
         v_out = self.v_cache
 
-        k_out[:, :, self.cache_pos[:seq_len]] = k_val
-        v_out[:, :, self.cache_pos[:seq_len]] = v_val
+        k_out[:, :, self.cache_pos:target_pos] = k_val
+        v_out[:, :, self.cache_pos:target_pos] = v_val
 
-        self.cache_pos.add_(seq_len)
+        self.cache_pos = target_pos
 
         return k_out, v_out
 
@@ -117,7 +115,8 @@ class CasualSelfAttention(nn.Module):
         self.GQA_factor = config.GQA_factor
 
         # Key/Value cache
-        self.KV_cache = KVCache(1, self.block_size, self.kv_head, self.h_dim, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+        self.KV_cache = KVCache(1, self.block_size*2, self.kv_head, self.h_dim, dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16)
+        self.Y_cache = None
 
         # Linear Projections
         assert self.n_embd % self.GQA_factor == 0, "Embedding dimension must be divisible by GQA factor"
@@ -138,7 +137,7 @@ class CasualSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                  .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x, cache_enable):
+    def forward(self, x, cache_enable=False):
         # Input shape: (B, T, C)
         B, T, C = x.size()
 
@@ -147,7 +146,6 @@ class CasualSelfAttention(nn.Module):
         k = self.c_attn_k(x).view(B, T, self.kv_head, self.h_dim).transpose(1, 2)   #(B, n_head//GQA_factor, T, h_dim)
         v = self.c_attn_v(x).view(B, T, self.kv_head, self.h_dim).transpose(1, 2)   #(B, n_head//GQA_factor, T, h_dim)
 
-        # Cache enable
         if cache_enable:
             k, v = self.KV_cache.update(k, v)
 
@@ -170,6 +168,9 @@ class CasualSelfAttention(nn.Module):
         # Reshape and project
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         y = self.resid_dropout(self.c_proj(y))
+        if cache_enable:
+            y = torch.cat([y, self.Y_cache], dim=1) if self.Y_cache is not None else y
+            self.Y_cache = y
         return y
 
 class MLP(nn.Module):
@@ -196,14 +197,11 @@ class Block(nn.Module):
         self.mlp = MLP(config)
         self.n_embd = config.n_embd
 
-    def forward(self, x, cache_enable):
+    def forward(self, x, cache_enable=False):
         # Residual connection
         x = x + self.attn(F.rms_norm(x, normalized_shape=[self.n_embd]), cache_enable=cache_enable)
         x = x + self.mlp(F.rms_norm(x, normalized_shape=[self.n_embd]))
         return x
-
-    def clear_cache(self):
-        self.attn.KV_cache.reset()
 
 class GPT(nn.Module):
     def __init__(self, config: GPTConfig):
@@ -216,7 +214,7 @@ class GPT(nn.Module):
             dict(
                 wte = nn.Embedding(self.config.vocab_size, self.config.n_embd),                                 # Token embedding
                 drop = nn.Dropout(self.config.dropout, inplace=True),                                           # Dropout
-                h = nn.ModuleList([Block(self.config) for _ in range(self.config.n_layers)]),        # Transformer blocks
+                h = nn.ModuleList([Block(self.config) for _ in range(self.config.n_layers)]),                   # Transformer blocks
                 # ln_f = nn.RMSNorm(self.config.n_embd)                                                         # Final normalization
             )
         )
@@ -256,10 +254,6 @@ class GPT(nn.Module):
 
         return torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8)
 
-    def clear_cache(self):
-        for block in self.transformer.h:
-            block.clear_cache()
-
     def forward(self, x, targets=None, cache_enable=False):
         # Batch size and sequence length
         B, T = x.size()
@@ -273,7 +267,7 @@ class GPT(nn.Module):
 
         # Transformer blocks
         for block in self.transformer.h:
-            x = block(x, cache_enable=cache_enable)
+            x = block(x)
 
         # Final normalization
         x = F.rms_norm(x, normalized_shape=[self.config.n_embd])
@@ -290,8 +284,8 @@ class GPT(nn.Module):
 
         return logits, loss
 
-    @torch.no_grad()
-    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None, cache_enable=False):
+    @torch.inference_mode()
+    def generate(self, x, max_new_tokens, temperature=1.0, end_token=None):
         # Batch size and sequence length
         B, T = x.size()
         assert T <= self.config.block_size, "Cannot forward, model block size is exhausted."
@@ -302,18 +296,11 @@ class GPT(nn.Module):
 
         # Generation loop
         for i in range(T,T+max_new_tokens):
-            # Get the last T tokens, feed them to the model, and get the logits
-            if cache_enable:
-                logits, _ = self(x, targets=None, cache_enable=cache_enable)
-
-            logits2, _ = self(output[:, max(0, i - self.config.block_size):i])
-            print(logits.shape,logits2.shape)
-
-            for a, b in zip(logits, logits2):
-                print(a, b)
+            # Get the last tokens, feed them to the model, and get the logits
+            logits, _ = self(x, targets=None, cache_enable=True)
 
             # Temperature scaling
-            logits = logits[:, -1, :] / temperature
+            logits = logits[:,-1,:] / temperature
 
             # Sample from the distribution
             probs = F.softmax(logits, dim=-1)
@@ -327,6 +314,9 @@ class GPT(nn.Module):
             if x_next >= end_token:
                 break
 
-        # Return the generated sequence
-        self.clear_cache()
+        # Clear cache
+        for blk in self.transformer.h:
+            blk.attn.KV_cache.reset()
+
+        # Return
         return output[:, :i+1]
